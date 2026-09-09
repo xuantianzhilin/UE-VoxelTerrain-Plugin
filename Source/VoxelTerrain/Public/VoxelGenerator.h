@@ -16,7 +16,7 @@ class VOXELTERRAIN_API UVoxelGenerator : public UObject
 	
 public:
 	
-	UFUNCTION(BlueprintNativeEvent, Category = "Voxel")
+	UFUNCTION(BlueprintNativeEvent, Category = "Voxel|Generator")
 	void GenerateVoxel(AVoxelTerrainActor* Terrain) const;
 	
 };

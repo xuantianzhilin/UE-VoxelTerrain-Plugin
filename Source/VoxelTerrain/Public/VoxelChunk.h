@@ -12,15 +12,6 @@ namespace Voxel
 	constexpr int32 LENGTH = 16;
 	constexpr int32 SQUARE = LENGTH * LENGTH;
 	constexpr int32 VOLUME = LENGTH * LENGTH * LENGTH;
-
-	/* VoxelType 解析失败计数：FVoxelState::GetTypeInstance 失败时 +1；
-	   AVoxelTerrainActor 重建网格前清零、重建后检查，非 0 说明 AssetManager 初次扫描可能还没完成，
-	   需要延迟自动重建（编辑器冷启动的竞态防护）。仅游戏线程访问。 */
-	inline int32& VoxelTypeResolveFailures()
-	{
-		static int32 Failures = 0;
-		return Failures;
-	}
 }
 
 USTRUCT(BlueprintType)
@@ -60,6 +51,25 @@ struct FVoxelMeshData
 	UMaterialInterface* Material = nullptr;
 };
 
+/** 一条导航连接：从某个落脚格指向水平 4 邻里的另一个落脚格（邻格可能属于相邻 Section） */
+struct FVoxelNavLink
+{
+	/** 目标格所属的 Section（Section 单位坐标） */
+	FIntVector OwnnerSection;
+	/** 目标格在该 Section 内的局部体素坐标（0 ~ Voxel::LENGTH-1） */
+	FIntVector LinkCoord;
+};
+
+/** 一个落脚格：本格自己的净空 + 到水平 4 邻的连接 */
+struct FVoxelNavCell
+{
+	/** 本格能通过的最高 AI（体素单位）：从本格起向上数连续的净空格数，与旧寻路的 AgentHeight 同义。
+	 *  净空数到导航天花板（AVoxelTerrainActor::GetMaxNavHeight）为止，之上的空间不作考虑 */
+	int32 AllowHeight = 0;
+	/** 走得通的邻格：只含水平 4 邻，且与本格高度差在 FVoxelSection::LinkHeight 内（净空由对方那条记录自己给） */
+	TArray<FVoxelNavLink> Links;
+};
+
 /*方块数据的基本单位*/
 USTRUCT()
 struct FVoxelSection
@@ -67,6 +77,9 @@ struct FVoxelSection
 public:
 
 	GENERATED_BODY()
+
+	FVoxelSection() = default;
+	explicit FVoxelSection(FIntVector Coord) : SectionCoord(MoveTemp(Coord)) {}
 
 	FVoxelState GetVoxel(FIntVector Coord) const;
 	bool SetVoxel(FIntVector Coord, FVoxelState State);
@@ -77,10 +90,16 @@ public:
 	 * @param SectionCoord	本 Section 的坐标（Section 为单位，非体素坐标），用于向相邻 Section 查询遮挡
 	 * @return	每个材质（Type + Rotation）一个 FVoxelMeshData，顶点均为 Section 局部坐标（原点在 Section 的 (0,0,0) 角点）
 	 */
-	TArray<FVoxelMeshData> BuildMeshData(const AVoxelTerrainActor* Terrain, FIntVector SectionCoord) const;
+	TArray<FVoxelMeshData> BuildMeshData(const AVoxelTerrainActor* Terrain) const;
 
-	/** 排查用：把本 Section 的存储特征拼成一行，方便对比保存前/载入后的差异 */
-	FString ToDebugString() const;
+	/**
+	 * 烘焙本 Section 的导航数据到 NavData（每次调用整体重建本 Section 的部分）。
+	 * 节点是"落脚格"：自身为空、下方有支撑（体素或被静态网格体等外部阻碍占据的格都算支撑）。
+	 * 连接规则：只连水平 4 邻，且两格高度差在 LinkHeight 内；骨骼网格体不参与烘焙。
+	 * Key = 落脚格在本 Section 内的局部坐标，Value 见 FVoxelNavCell；链接目标可能落在相邻 Section。
+	 * 注意：外扩一圈只为判定边界格与邻格，本函数不会写入相邻 Section 的数据（那边烘焙自己的）。
+	 */
+	void BuildNavData(const AVoxelTerrainActor* Terrain);
 
 private:
 
@@ -92,9 +111,8 @@ private:
 	int32 PackedDataNeedSize() const;
 	uint32 FindOrAddPalenteIndex(FVoxelState State);
 
-	static bool IsFaceVisible(const UVoxelType* Source, const UVoxelType* Target);
-	static FIntVector GetOffsetCoord(int32 Source, int32 Direction);
-
+	UPROPERTY()
+	FIntVector SectionCoord;
 	UPROPERTY()
 	int32 BitsPerVoxel = 0;			// 每个体素的位数，0表示单值模式，>0表示调色板模式
 	UPROPERTY()
@@ -104,6 +122,11 @@ private:
 	UPROPERTY()
 	TArray<uint32> PackedData;		// 位打包数据
 
+	/* 导航数据：Key = 本 Section 内的落脚格局部坐标，Value = 该格的净空与到水平 4 邻的连接。
+	   只由 BuildNavData 生成（未烘焙时为空），是派生数据，不参与序列化 */
+	TMap<FIntVector, FVoxelNavCell> NavData;
+
+	static constexpr int32 LinkHeight = 1;
 };
 
 USTRUCT()
@@ -114,7 +137,7 @@ public:
 	GENERATED_BODY()
 
 	FVoxelChunk() = default;
-	FVoxelChunk(int32 InMinHeight, int32 InMaxHeight);
+	FVoxelChunk(FIntVector2 InChunkCoord, int32 InMinHeight, int32 InMaxHeight);
 
 	/** SectionZ 为全局 Section 索引（Chunk 只按 X/Y 划分，Z 由 MinHeight 换算），越界返回 nullptr */
 	const FVoxelSection* GetSection(int32 SectionZ) const;
@@ -124,24 +147,20 @@ public:
 	 * 重建 SectionCoord 所在 Section 的网格（每个材质一个 mesh section），并挂到本 Chunk 的 ProceduralMeshComponent 上。
 	 * @param SectionCoord	Section 坐标（Section 单位），X/Y 用于组件命名，Z 用于定位 Section
 	 */
-	void BuildMesh(AVoxelTerrainActor* Terrain, FIntVector SectionCoord);
-	void BuildAllMeshes(AVoxelTerrainActor* Terrain, FIntVector2 ChunkCoord);
+	void BuildMesh(AVoxelTerrainActor* Terrain, int32 CoordZ);
+	void BuildAllMeshes(AVoxelTerrainActor* Terrain);
 
 	void ClearMesh(int32 CoordZ);
 	void ClearAllMeshes();
-
-	/**
-	 * 校验载入的存档与当前高度范围是否一致：BaseSectionZ 与 Section 数量都对得上才认为可用。
-	 * 通过时会顺手把 MeshComponents 补齐到正确长度（存档里是 null，网格组件是运行时创建的）。
-	 */
-	bool SyncHeightRange(int32 InMinHeight, int32 InMaxHeight);
 
 private:
 
 	// 全局 Section Z 索引 -> 本 Chunk 的 Sections 下标（MinHeight 必须是 LENGTH 的整数倍）
 	int32 GetSectionIndex(int32 SectionZ) const;
-	UProceduralMeshComponent* FindOrAddChunkMeshComponent(AVoxelTerrainActor* Terrain, FIntVector SectionCoord, int32 Index);
+	UProceduralMeshComponent* FindOrAddChunkMeshComponent(AVoxelTerrainActor* Terrain, int32 Index);
 
+	UPROPERTY()
+	FIntVector2 ChunkCoord;
 	UPROPERTY()
 	int32 BaseSectionZ = 0;			// 本 Chunk 第一个 Section 的全局 Z 索引 = MinHeight / LENGTH（默认构造必须归零，否则 LogClass 会报未初始化）
 	UPROPERTY()
