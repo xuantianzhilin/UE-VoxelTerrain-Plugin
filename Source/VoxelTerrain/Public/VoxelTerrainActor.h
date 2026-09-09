@@ -7,7 +7,6 @@
 
 class UVoxelGenerator;
 class UProceduralMeshComponent;
-struct FVoxelPathSolver;
 
 namespace Voxel
 {
@@ -52,16 +51,25 @@ public:
 	FVector CoordToWorldLocation(FIntVector Coord) const;
 	UFUNCTION(BlueprintCallable, Category = "Voxel")
 	const FVector& GetVoxelSize() const { return VoxelSize; }
-	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
-	int32 GetMaxNavHeight() const { return FMath::Max(MaxHeight, MaxNavHeight); }
 
 	UFUNCTION(BlueprintCallable, Category = "Voxel")
 	void SetVoxel(FIntVector Coord, FName TypeName, const FRotator& Rotation = FRotator::ZeroRotator);
 	UFUNCTION(BlueprintCallable, Category = "Voxel")
 	void SetVoxels(const TArray<FIntVector>& Coords, FName TypeName, const FRotator& Rotation = FRotator::ZeroRotator);
 
+	/*重建该 Section 的网格与导航数据；编辑处落在边界上时，相邻 Section 的遮挡/连接也会变，一并标脏*/
+	UFUNCTION(BlueprintCallable, Category = "Voxel")
+	void MarkSectionDirty(FIntVector SectionCoord, FIntVector LocalCoord);
+	/*按预算消化脏区：每个脏 Section 同时重建网格与导航数据（MaxCount<=0 表示不限数量）*/
+	UFUNCTION(BlueprintCallable, Category = "Voxel")
+	void RebuildDirtySections(int32 MaxCount = 0);
+
 	UFUNCTION(BlueprintCallable, Category = "Voxel")
 	FVoxelState GetVoxel(FIntVector Coord) const;
+
+	/*清地形：销毁网格组件、丢掉 Chunk（连带其导航数据）与刷过的区域权重*/
+	UFUNCTION(BlueprintCallable, Category = "Voxel")
+	void ClearTerrain();
 
 	const FVoxelSection* GetChunkSection(FIntVector SectionCoord) const;
 	FVoxelSection* GetChunkSection(FIntVector SectionCoord);
@@ -69,7 +77,7 @@ public:
 	/**
 	 * 填充长方体。Min/Max 是体素坐标的闭区间（含两端），写反会自动纠正，Z 超出有效高度范围会被裁掉。
 	 * TypeName 传 NAME_None 即为挖空该区域。
-	 * @param RebuildCount	默认 0：批量写入后全部交给 Tick 分摊重建。编辑器里不跑 Tick，要立刻看到结果就传 >0 或再调 RebuildAllSections()
+	 * @param RebuildCount	默认 0：批量写入后全部交给 Tick 分摊重建。编辑器里不跑 Tick，要立刻看到结果就传 >0 或再调 BuildAllMeshes()
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Voxel", meta = (Keywords = "box fill rect 长方体 立方体 填充 挖空"))
 	void FillBox(FIntVector Min, FIntVector Max, FName TypeName, const FRotator& Rotation = FRotator::ZeroRotator);
@@ -82,17 +90,6 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Voxel", meta = (Keywords = "sphere ball round 球 球体 圆形 生成"))
 	void FillSphere(FIntVector Center, double Radius, FName TypeName, const FRotator& Rotation = FRotator::ZeroRotator, bool bSolid = true);
 
-	/*重建该 Section 的网格；编辑处位于 Section 边界时，相邻 Section 的遮挡关系也会变化，一并重建*/
-	UFUNCTION(BlueprintCallable, Category = "Voxel")
-	void MarkSectionDirty(FIntVector SectionCoord, FIntVector LocalCoord);
-	UFUNCTION(BlueprintCallable, Category = "Voxel")
-	void RebuildDirtySections(int32 MaxCount = 0);
-	/*重建所有 Section 的网格：不走脏区队列，数据没变化时也能把网格恢复出来（编辑器按钮用）*/
-	UFUNCTION(BlueprintCallable, Category = "Voxel")
-	void RebuildAllSections();
-	UFUNCTION(BlueprintCallable, Category = "Voxel")
-	void ClearTerrain();
-
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Generator")
 	void RunDefaultGenerator();
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Generator")
@@ -103,8 +100,8 @@ public:
 	UFUNCTION(Category = "Voxel", meta = (CallInEditor = "true", DisplayName = "生成默认地形", DisplayPriority = "1", Tooltip = "用 VoxelGenerator 指向的生成器蓝图填充体素并立刻重建网格。"))
 	void EditorRunDefaultGenerator();
 
-	/* 细节面板按钮：销毁全部 Section 网格组件并清空 Chunk 数据 */
-	UFUNCTION(Category = "Voxel", meta = (CallInEditor = "true", DisplayName = "清除地形", DisplayPriority = "2", Tooltip = "销毁所有 Section 网格组件并清空 Chunk 数据，保存关卡后地图里就不再有地形。同时这也是解锁 VoxelSize / MinHeight / MaxHeight 的手段（有数据时这三项不可修改）。"))
+	/* 细节面板按钮：销毁全部 Section 网格组件、清空 Chunk 数据与其导航数据/权重 */
+	UFUNCTION(Category = "Voxel", meta = (CallInEditor = "true", DisplayName = "清除地形", DisplayPriority = "2", Tooltip = "销毁所有 Section 网格组件、清空 Chunk 数据（连带已烘焙的导航数据）与刷过的区域权重，保存关卡后地图里就不再有地形。同时这也是解锁 VoxelSize / MinHeight / MaxHeight 的手段（有数据时这三项不可修改）。"))
 	void EditorClearTerrain();
 
 	/* 细节面板按钮：按现有体素数据重建网格并删掉多余组件（正常载入不需要，存档里已经带着网格）*/
@@ -112,20 +109,70 @@ public:
 	void EditorRebuildAllSections();
 #endif
 
-	/* ===================== 寻路（不依赖 NavMesh，直接基于体素数据） ===================== */
+	/*================================ 地形网格 ======================================*/
 
+public:
+
+	UFUNCTION(BlueprintCallable, Category = "Voxel|Mesh")
+	void BuildAllMeshes();
+
+private:
+
+#if WITH_EDITOR
+	void BuildMeshesInEditor(bool bForced = false);
+#endif
+
+	/* ===================== 寻路（不依赖 NavMesh，走烘焙出来的导航数据） ===================== */
+
+public:
+
+	/** 净空统计的格数上限：落脚格向上数这么多格还没被挡，就按“至少这么高”封顶（见 FVoxelNavCell::AllowHeight）。
+	 *  刻意夹在 [1, Voxel::LENGTH]：净空是向上看的，不超过一层，改一体素时才只需连下方那一层一起重烘 */
+	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
+	int32 GetMaxAllowHeight() const { return FMath::Clamp(MaxAllowHeight, 1, Voxel::LENGTH); }
+
+	/*全量烘焙所有 Section 的导航数据（BeginPlay 已经调过一次；运行期改体素走脏区局部重建）*/
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
 	void BuildNavData();
 
+	/* 区域通行权重：查询期数据，不参与烘焙（刷权重不需要重烘，烘焙也不读它）。
+	   1=正常，>1 更难走，0=软墙（能站但没人绕过来），负数/NaN 拒收；等于 1 的条目不落表 */
+	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
+	void SetVoxelPathWeight(FIntVector Coord, float Weight);
+	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
+	void ClearVoxelPathWeight(FIntVector Coord);
+	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
+	float GetVoxelPathWeight(FIntVector Coord) const;
+	/*闭区间批量刷权重；Weight 传 1 等于清掉这一片的权重*/
+	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
+	void SetVoxelPathWeightBox(FIntVector Min, FIntVector Max, float Weight);
 
-	//UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
-	//void SetVoxelPathWeight(FIntVector Coord, float Weight);
-	//UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
-	//void ClearVoxelPathWeight(FIntVector Coord);
-	//UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
-	//float GetVoxelPathWeight(FIntVector Coord) const;
-	//UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
-	//void SetVoxelPathWeightBox(FIntVector Min, FIntVector Max, float Weight);
+	/** 按全局体素坐标取导航节点；返回 nullptr 表示该格不是落脚格（不是地面、被挡住、没烘到或没有 Chunk）*/
+	const FVoxelNavCell* FindNavCell(const FIntVector& GlobalCoord) const;
+
+	/** 把坐标吸附到导航图上：在它周围的立方半径内扫一圈，返回净空够 AgentHeight 的落脚格里最近的那个（半径上限 16）*/
+	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation", meta = (Keywords = "snap nearest 吸附 最近"))
+	bool FindNearbyNavCoord(FIntVector Coord, int32 AgentHeight, int32 Radius, FIntVector& OutCoord) const;
+
+	/**
+	 * A* 寻路：沿烘焙好的 NavData 从起点走到终点，只走水平 4 邻（正交网格，无斜向），
+	 * 每步只会是烘焙时判定过走得通的那条 Link，因此不会穿墙也不会悬空。
+	 * @param StartCoord/EndCoord	全局体素坐标。两端自己必须就是落脚格且净空够，否则直接返回 false —— 先拿 FindNearbyNavCoord 吸附
+	 * @param AgentHeight			AI 身高（体素格数，至少 1）：路径上每格的 AllowHeight 都必须 >= 它。
+	 * 								净空是封顶统计的，传的值大于 GetMaxAllowHeight() 时全图没有格能满足，必定找不到路
+	 * @param OutPath				成功时按行走顺序返回，含起点与终点；失败时为空
+	 * 步价 = Max(1, 终点格权重)，权重为 0 的格当软墙跳过；启发式是正交步数的下界，可采纳，故结果是最短路径
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation", meta = (Keywords = "a star astar path 寻路 路径 找路"))
+	bool FindPath(FIntVector StartCoord, FIntVector EndCoord, int32 AgentHeight, TArray<FIntVector>& OutPath) const;
+
+	/** FindPath 的世界坐标版：两端各自换算成体素坐标后寻路，输出路径上每格中心的世界坐标 */
+	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation", meta = (Keywords = "a star astar path 寻路 路径 找路"))
+	bool FindPathWorld(FVector StartLocation, FVector EndLocation, int32 AgentHeight, TArray<FVector>& OutPath) const;
+
+	/*====================== 地形射线检测 ============================*/
+
+public:
 
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Query")
 	bool LineSingleTraceVoxel(const FVector& Start, const FVector& End, FVoxelTraceHit& OutHit);
@@ -134,7 +181,6 @@ protected:
 
 	UPROPERTY(EditAnywhere, Category = "Voxel", meta = (ToolTip = "单个体素的边长。已有地形数据时不可修改（先点“清除地形”），否则已生成的网格会与坐标尺度对不上。"))
 	FVector VoxelSize{ 100.0 };
-	/** 体素高度范围（体素为单位，必须是 Voxel::LENGTH 的整数倍） */
 	UPROPERTY(EditAnywhere, Category = "Voxel", meta = (ToolTip = "已有地形数据时不可修改（先点“清除地形”），Section 的划分依赖它。"))
 	int32 MinHeight = -16;
 	UPROPERTY(EditAnywhere, Category = "Voxel", meta = (ToolTip = "已有地形数据时不可修改（先点“清除地形”），Section 的划分依赖它。"))
@@ -143,8 +189,8 @@ protected:
 	TSoftClassPtr<UVoxelGenerator> VoxelGenerator;
 	UPROPERTY(EditAnywhere, Category = "Voxel|Generator")
 	bool bRunGeneratorOnBeginPlay = false;
-	UPROPERTY(EditAnywhere, Category = "Voxel|Navigation")
-	int32 MaxNavHeight = 70;
+	UPROPERTY(EditAnywhere, Category = "Voxel|Navigation", meta = (ClampMin = "1", ClampMax = "16", ToolTip = "净空（AllowHeight）统计的格数上限：落脚格向上数这么多格还没被挡就按“至少这么高”封顶。必须 >= 最重的 AI 体型，且不能超过一层的 16 格（否则局部重建要往下牵连的层数就不止一层）。"))
+	int32 MaxAllowHeight = 4;
 
 	UPROPERTY(VisibleAnywhere, Category = "Voxel")
 	TObjectPtr<USceneComponent> VoxelRoot;
@@ -178,12 +224,13 @@ private:
 	/*将世界坐标转换为Section坐标和Section内本地坐标*/
 	static TPair<FIntVector, FIntVector> WorldCoordToChunkLocalCoord(const FIntVector& WorldCoord);
 	FVoxelChunk& FindOrAddChunk(FIntVector2 ChunkCoord);
-	void BuildMeshesIfNeeded();
 
 	UPROPERTY()
 	TMap<FIntVector2, FVoxelChunk> Chunks;
 	TMap<FIntVector2, TArray<FIntVector>> DirtySections;
+#if WITH_EDITOR
 	bool bNeedsMeshBuild = false;
+#endif
 
 	UPROPERTY()
 	TMap<FIntVector, float> NavWeights;

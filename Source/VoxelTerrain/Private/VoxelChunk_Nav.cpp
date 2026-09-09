@@ -10,9 +10,6 @@ using namespace Voxel;
 
 namespace
 {
-	/* 净空向上扫描的格数上限：净空按体素计，128 格远超任何 AI 体型，只是给离谱的 MaxNavHeight 兜个底 */
-	constexpr int32 MaxNavClearanceSpan = 128;
-
 	/* 体素格闭区间：Min 是起始角点那一格，Size 是各轴的格数 */
 	struct FNavRegion
 	{
@@ -232,13 +229,15 @@ namespace
 	/**
 	 * 从这格起向上数连续的净空格数 = 站进这格的 AI 最高能有多高，数到第一个实心格为止。
 	 * 窄带之内查栅格，窄带之外按需查体素与阻碍：只有落脚格要算净空，所以不预先铺一块高栅格再整片扫描。
-	 * TopZ 之上没有数据可查，净空就此封顶。
+	 * 最多数到 MaxAllowHeight 格就封顶（"至少这么高"）：封顶值不超过一层，改一体素时受影响的下层
+	 * 落脚格才一定落在紧邻的那一层里，脏区标记（MarkSectionDirty）才能跟着网格用同一套规则。
 	 */
 	int32 ComputeNavClearance(const FNavSolidGrid& Grid, const FNavVoxelReader& Reader,
-		const TSet<FIntVector>& Obstacles, const FIntVector& Coord, int32 TopZ)
+		const TSet<FIntVector>& Obstacles, const FIntVector& Coord, int32 MaxAllowHeight)
 	{
 		int32 Height = 0;
-		for (int32 z = Coord.Z; z <= TopZ; ++z)
+		const int32 LastZ = Coord.Z + MaxAllowHeight - 1;
+		for (int32 z = Coord.Z; z <= LastZ; ++z)
 		{
 			const FIntVector Up(Coord.X, Coord.Y, z);
 			const bool bBlocked = Grid.Contains(Up)
@@ -264,16 +263,17 @@ void FVoxelSection::BuildNavData(const AVoxelTerrainActor* Terrain)
 
 	// 落脚判定用的窄带：本 Section 外扩一圈，X/Y 各 ±1 覆盖水平 4 邻格，
 	// Z 下扩 LinkHeight+1 覆盖邻格的支撑格（判断“可站立”要往下看一格），上扩 LinkHeight 覆盖台阶。
+	// 净空只从落脚格向上数 MaxAllowHeight 格，所以查询区域只要铺到最高落脚格之上这么多格即可。
+	const int32 MaxAllowHeight = Terrain->GetMaxAllowHeight();
 	const FIntVector SectionOrigin = SectionCoord * LENGTH;
 	const int32 BottomZ = SectionOrigin.Z - (LinkHeight + 1);
-	const int32 HighestStandableZ = SectionOrigin.Z + LENGTH + LinkHeight;	// 邻格可能站到的最高一层
-	const int32 TopZ = FMath::Clamp(FMath::Max(Terrain->GetMaxNavHeight(), HighestStandableZ),
-		HighestStandableZ, HighestStandableZ + MaxNavClearanceSpan);			// 净空扫描的天花板
+	const int32 HighestStandableZ = SectionOrigin.Z + LENGTH + LinkHeight;					// 邻格可能站到的最高一层
+	const int32 TopZ = FMath::Max(HighestStandableZ, SectionOrigin.Z + LENGTH - 1 + MaxAllowHeight - 1);
 
 	const int32 XYSize = LENGTH + 2;
 	const FIntVector PaddedMin(SectionOrigin.X - 1, SectionOrigin.Y - 1, BottomZ);
 	const FNavRegion StandRegion{ PaddedMin, FIntVector(XYSize, XYSize, HighestStandableZ - BottomZ + 1) };
-	// 阻碍查询要一直铺到天花板：头顶的桥、屋檐会压低下方落脚格的净空
+	// 阻碍查询要盖到净空看得到的最高处：头顶的桥、屋檐会压低下方落脚格的净空
 	const FNavRegion QueryRegion{ PaddedMin, FIntVector(XYSize, XYSize, TopZ - BottomZ + 1) };
 
 	// 1) 静态网格体等外部阻碍（只记下被挡住的格）
@@ -324,7 +324,7 @@ void FVoxelSection::BuildNavData(const AVoxelTerrainActor* Terrain)
 
 				// 可站但没有邻居的格也要留一条记录：Key 存在即代表这一格能站
 				FVoxelNavCell& Cell = NavData.Add(LocalCoord);
-				Cell.AllowHeight = ComputeNavClearance(Grid, Reader, Obstacles, Coord, TopZ);
+				Cell.AllowHeight = ComputeNavClearance(Grid, Reader, Obstacles, Coord, MaxAllowHeight);
 
 				for (const FIntVector& Direction : Directions)
 				{
@@ -350,5 +350,31 @@ void FVoxelSection::BuildNavData(const AVoxelTerrainActor* Terrain)
 				}
 			}
 		}
+	}
+}
+
+void FVoxelChunk::BuildNavData(AVoxelTerrainActor* Terrain, int32 CoordZ)
+{
+	const int32 Index = GetSectionIndex(CoordZ);
+	if (!Sections.IsValidIndex(Index))
+	{
+		return;		// 该高度不在本 Chunk 的范围内（脏区里合法地会混进越界的相邻 Section），与 BuildMesh 保持一致
+	}
+	Sections[Index].BuildNavData(Terrain);
+}
+
+void FVoxelChunk::BuildAllNavData(AVoxelTerrainActor* Terrain)
+{
+	for (FVoxelSection& Section : Sections)
+	{
+		Section.BuildNavData(Terrain);
+	}
+}
+
+void FVoxelChunk::ClearAllNavData()
+{
+	for (FVoxelSection& Section : Sections)
+	{
+		Section.ClearNavData();
 	}
 }

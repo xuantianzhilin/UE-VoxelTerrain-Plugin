@@ -64,7 +64,7 @@ struct FVoxelNavLink
 struct FVoxelNavCell
 {
 	/** 本格能通过的最高 AI（体素单位）：从本格起向上数连续的净空格数，与旧寻路的 AgentHeight 同义。
-	 *  净空数到导航天花板（AVoxelTerrainActor::GetMaxNavHeight）为止，之上的空间不作考虑 */
+	 *  数到 AVoxelTerrainActor::GetMaxAllowHeight() 格就封顶，取到该值只表示“至少这么高” */
 	int32 AllowHeight = 0;
 	/** 走得通的邻格：只含水平 4 邻，且与本格高度差在 FVoxelSection::LinkHeight 内（净空由对方那条记录自己给） */
 	TArray<FVoxelNavLink> Links;
@@ -100,6 +100,8 @@ public:
 	 * 注意：外扩一圈只为判定边界格与邻格，本函数不会写入相邻 Section 的数据（那边烘焙自己的）。
 	 */
 	void BuildNavData(const AVoxelTerrainActor* Terrain);
+	void ClearNavData() { NavData.Reset(); }
+	const TMap<FIntVector, FVoxelNavCell>& GetNavData() const { return NavData; }
 
 private:
 
@@ -152,6 +154,10 @@ public:
 
 	void ClearMesh(int32 CoordZ);
 	void ClearAllMeshes();
+
+	void BuildNavData(AVoxelTerrainActor* Terrain, int32 CoordZ);
+	void BuildAllNavData(AVoxelTerrainActor* Terrain);
+	void ClearAllNavData();
 
 private:
 

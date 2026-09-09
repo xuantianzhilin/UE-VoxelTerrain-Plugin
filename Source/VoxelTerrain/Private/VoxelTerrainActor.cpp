@@ -30,137 +30,6 @@ FVector AVoxelTerrainActor::CoordToWorldLocation(FIntVector Coord) const
 	return GetActorTransform().TransformPosition(LocalPos);
 }
 
-const FVoxelSection* AVoxelTerrainActor::GetChunkSection(FIntVector SectionCoord) const
-{
-	return const_cast<AVoxelTerrainActor*>(this)->GetChunkSection(SectionCoord);
-}
-
-FVoxelSection* AVoxelTerrainActor::GetChunkSection(FIntVector SectionCoord)
-{
-	if (FVoxelChunk* Chunk = Chunks.Find(FIntVector2{ SectionCoord }))
-	{
-		return Chunk->GetSection(SectionCoord.Z);
-	}
-	return nullptr;
-}
-
-void AVoxelTerrainActor::RunDefaultGenerator()
-{
-	if (!VoxelGenerator.IsNull())
-	{
-		UClass* GeneratorClass = VoxelGenerator.IsValid() ? VoxelGenerator.Get() : VoxelGenerator.LoadSynchronous();
-		RunGenerator(GeneratorClass);
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning, TEXT("未指定默认体素生成器"));
-	}
-}
-
-void AVoxelTerrainActor::RunGenerator(TSubclassOf<UVoxelGenerator> GeneratorClass)
-{
-	const UVoxelGenerator* Generator = GeneratorClass ? GeneratorClass->GetDefaultObject<UVoxelGenerator>() : nullptr;
-	if (!Generator)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("体素生成器无效，跳过生成"));
-		return;
-	}
-
-	Generator->GenerateVoxel(this);
-}
-
-#if WITH_EDITOR
-void AVoxelTerrainActor::EditorRunDefaultGenerator()
-{
-	// CallInEditor 外层已有事务，Modify() 让被改到的 UPROPERTY 状态可撤销
-	Modify();
-	RunDefaultGenerator();
-	RebuildAllSections();
-	MarkPackageDirty();
-}
-
-void AVoxelTerrainActor::EditorClearTerrain()
-{
-	Modify();
-	ClearTerrain();
-	MarkPackageDirty();
-}
-
-void AVoxelTerrainActor::EditorRebuildAllSections()
-{
-	RebuildAllSections();
-}
-#endif
-
-void AVoxelTerrainActor::BuildNavData()
-{
-	if (Chunks.IsEmpty()) return;
-
-	// Section 划分只由 MinHeight/MaxHeight 决定（构造 Chunk 时已保证 MinHeight 是 LENGTH 的整数倍），
-	// 每个 Chunk 的 Z 覆盖范围都一样，直接按全局 Section Z 取即可
-	const int32 FirstSectionZ = MinHeight / Voxel::LENGTH;
-	const int32 SectionCount = (MaxHeight - MinHeight) / Voxel::LENGTH;
-
-	int32 SectionCountBaked = 0;
-	for (auto& [ChunkCoord, Chunk] : Chunks)
-	{
-		for (int32 i = 0; i < SectionCount; ++i)
-		{
-			if (FVoxelSection* Section = Chunk.GetSection(FirstSectionZ + i))
-			{
-				Section->BuildNavData(this);
-				++SectionCountBaked;
-			}
-		}
-	}
-
-	UE_LOG(LogTemp, Verbose, TEXT("[Voxel] %s：已烘焙 %d 个 Section 的导航数据"),
-		*GetName(), SectionCountBaked);
-}
-
-void AVoxelTerrainActor::Serialize(FArchive& Ar)
-{
-	// 对象复制（进 PIE / 复制 Actor）和撤销记录不是包体 IO，那种场合数据本来就整体拷贝。
-	const bool bIsPackageIO = Ar.IsPersistent()
-		&& !Ar.HasAnyPortFlags(PPF_Duplicate | PPF_DuplicateForPIE) && !Ar.IsTransacting();
-
-	Super::Serialize(Ar);
-
-	if (Ar.IsLoading() && bIsPackageIO)
-	{
-		DirtySections.Reset();
-		// 网格组件是派生数据（RF_Transient，不入档），载入后需要按体素数据补建一次
-		bNeedsMeshBuild = !Chunks.IsEmpty();
-	}
-}
-
-#if WITH_EDITOR
-bool AVoxelTerrainActor::CanEditChange(const FProperty* InProperty) const
-{
-	if (InProperty && !Chunks.IsEmpty())
-	{
-		// 这三项决定了体素尺度与 Section 的划分，有数据之后再改会让已存的体素和网格整体错位
-		const FName Name = InProperty->GetFName();
-		if (Name == GET_MEMBER_NAME_CHECKED(AVoxelTerrainActor, VoxelSize) ||
-			Name == GET_MEMBER_NAME_CHECKED(AVoxelTerrainActor, MinHeight) ||
-			Name == GET_MEMBER_NAME_CHECKED(AVoxelTerrainActor, MaxHeight))
-		{
-			return false;
-		}
-	}
-
-	return Super::CanEditChange(InProperty);
-}
-#endif
-
-FVoxelState AVoxelTerrainActor::GetVoxel(FIntVector Coord) const
-{
-	const auto [SectionCoord, LocalCoord] = WorldCoordToChunkLocalCoord(Coord);
-	const FVoxelChunk* Chunk = Chunks.Find(FIntVector2{ SectionCoord });
-	const FVoxelSection* Section = Chunk ? Chunk->GetSection(SectionCoord.Z) : nullptr;
-	return Section ? Section->GetVoxel(LocalCoord) : FVoxelState{};
-}
-
 void AVoxelTerrainActor::SetVoxel(FIntVector Coord, FName TypeName, const FRotator& Rotation)
 {
 	SetVoxels({ Coord }, TypeName, Rotation);
@@ -200,6 +69,106 @@ void AVoxelTerrainActor::SetVoxels(const TArray<FIntVector>& Coords, FName TypeN
 			}
 		}
 	}
+}
+
+void AVoxelTerrainActor::MarkSectionDirty(FIntVector SectionCoord, FIntVector LocalCoord)
+{
+	// 本 Section 必然要重建；改动落在边界上时，相邻 Section 的遮挡判断结果也会变，同样要重建
+	FIntVector SectionCoords[7] = { SectionCoord };
+	int32 Num = 1;
+	auto AddNeighbor = [&](const FIntVector& Offset)
+		{
+			SectionCoords[Num++] = SectionCoord + Offset;
+		};
+
+	if (LocalCoord.X == 0)					AddNeighbor({ -1, 0, 0 });
+	if (LocalCoord.X == Voxel::LENGTH - 1)	AddNeighbor({ 1, 0, 0 });
+	if (LocalCoord.Y == 0)					AddNeighbor({ 0, -1, 0 });
+	if (LocalCoord.Y == Voxel::LENGTH - 1)	AddNeighbor({ 0, 1, 0 });
+	// 净空（AllowHeight）是从落脚格向上数的：改了某一体素，同列上"向上扫得到它"的那些落脚格就全要重算，
+	// 那些格子都在改动处之下、最远差 MaxAllowHeight-1 格，所以贴着底部时得连下方 Section 一起重烘。
+	// 严格的条件是 Z < MaxAllowHeight - 1，这里取 < MaxAllowHeight 多标一行（宁滥勿漏）；
+	// 封顶值被夹在一层（Voxel::LENGTH）以内，故牵连范围不会超过下方一个 Section
+	if (LocalCoord.Z < GetMaxAllowHeight())	AddNeighbor({ 0, 0, -1 });
+	if (LocalCoord.Z == Voxel::LENGTH - 1)	AddNeighbor({ 0, 0, 1 });
+	// Z 方向相邻 Section 必然属于同一个 Chunk（Chunk 只按 X/Y 划分），超出高度范围时 BuildMesh/BuildNavData 内部会跳过
+
+	for (int32 i = 0; i < Num; ++i)
+	{
+		// 不存在的相邻 Chunk 本来也没有要重建的网格；键一律用坐标，
+		// 因为 FindOrAddChunk 插入新元素会让 TMap 重排，任何 FVoxelChunk* 键都会失效
+		const FIntVector2 NeighborChunkCoord{ SectionCoords[i].X, SectionCoords[i].Y };
+		if (Chunks.Contains(NeighborChunkCoord))
+		{
+			DirtySections.FindOrAdd(NeighborChunkCoord).AddUnique(SectionCoords[i]);
+		}
+	}
+}
+
+void AVoxelTerrainActor::RebuildDirtySections(int32 MaxCount)
+{
+	int32 Budget = MaxCount <= 0 ? TNumericLimits<int32>::Max() : MaxCount;
+	for (auto It = DirtySections.CreateIterator(); It && Budget > 0;)
+	{
+		FVoxelChunk* Chunk = Chunks.Find(It->Key);
+		TArray<FIntVector>& Pending = It->Value;
+
+		while (Pending.Num() > 0 && Budget > 0)
+		{
+			const FIntVector SectionCoord = Pending.Pop();
+			if (Chunk)
+			{
+				Chunk->BuildMesh(this, SectionCoord.Z);
+				Chunk->BuildNavData(this, SectionCoord.Z);
+			}
+			--Budget;
+		}
+
+		// 只有处理干净了才摘掉这一项，预算用尽时剩下的留给下一帧
+		if (Pending.Num() == 0)
+		{
+			It.RemoveCurrent();
+		}
+	}
+}
+
+FVoxelState AVoxelTerrainActor::GetVoxel(FIntVector Coord) const
+{
+	const auto [SectionCoord, LocalCoord] = WorldCoordToChunkLocalCoord(Coord);
+	const FVoxelChunk* Chunk = Chunks.Find(FIntVector2{ SectionCoord });
+	const FVoxelSection* Section = Chunk ? Chunk->GetSection(SectionCoord.Z) : nullptr;
+	return Section ? Section->GetVoxel(LocalCoord) : FVoxelState{};
+}
+
+void AVoxelTerrainActor::ClearTerrain()
+{
+	DirtySections.Reset();
+	for (auto& [ChunkCoord, Chunk] : Chunks)
+	{
+		Chunk.ClearAllMeshes();
+		Chunk.ClearAllNavData();
+	}
+	Chunks.Reset();
+	NavWeights.Reset();
+#if WITH_EDITOR
+	// 数据都清了就不该再留"要补建网格"的标记：否则编辑器里下一次 PostRegisterAllComponents
+	// 会挂着 AssetManager 回调对着空 Chunks 跑一遍全量重建
+	bNeedsMeshBuild = false;
+#endif
+}
+
+const FVoxelSection* AVoxelTerrainActor::GetChunkSection(FIntVector SectionCoord) const
+{
+	return const_cast<AVoxelTerrainActor*>(this)->GetChunkSection(SectionCoord);
+}
+
+FVoxelSection* AVoxelTerrainActor::GetChunkSection(FIntVector SectionCoord)
+{
+	if (FVoxelChunk* Chunk = Chunks.Find(FIntVector2{ SectionCoord }))
+	{
+		return Chunk->GetSection(SectionCoord.Z);
+	}
+	return nullptr;
 }
 
 void AVoxelTerrainActor::FillBox(FIntVector Min, FIntVector Max, FName TypeName, const FRotator& Rotation)
@@ -291,63 +260,55 @@ void AVoxelTerrainActor::FillSphere(FIntVector Center, double Radius, FName Type
 	SetVoxels(Coords, TypeName, Rotation);
 }
 
-void AVoxelTerrainActor::MarkSectionDirty(FIntVector SectionCoord, FIntVector LocalCoord)
+void AVoxelTerrainActor::RunDefaultGenerator()
 {
-	// 本 Section 必然要重建；改动落在边界上时，相邻 Section 的遮挡判断结果也会变，同样要重建
-	FIntVector SectionCoords[7] = { SectionCoord };
-	int32 Num = 1;
-	auto AddNeighbor = [&](const FIntVector& Offset)
+	if (!VoxelGenerator.IsNull())
 	{
-		SectionCoords[Num++] = SectionCoord + Offset;
-	};
-
-	if (LocalCoord.X == 0)					AddNeighbor({ -1, 0, 0 });
-	if (LocalCoord.X == Voxel::LENGTH - 1)	AddNeighbor({ 1, 0, 0 });
-	if (LocalCoord.Y == 0)					AddNeighbor({ 0, -1, 0 });
-	if (LocalCoord.Y == Voxel::LENGTH - 1)	AddNeighbor({ 0, 1, 0 });
-	if (LocalCoord.Z == 0)					AddNeighbor({ 0, 0, -1 });
-	if (LocalCoord.Z == Voxel::LENGTH - 1)	AddNeighbor({ 0, 0, 1 });
-	// Z 方向相邻 Section 必然属于同一个 Chunk（Chunk 只按 X/Y 划分），超出高度范围时 BuildMesh 内部会跳过
-
-	for (int32 i = 0; i < Num; ++i)
+		UClass* GeneratorClass = VoxelGenerator.IsValid() ? VoxelGenerator.Get() : VoxelGenerator.LoadSynchronous();
+		RunGenerator(GeneratorClass);
+	}
+	else
 	{
-		// 不存在的相邻 Chunk 本来也没有要重建的网格；键一律用坐标，
-		// 因为 FindOrAddChunk 插入新元素会让 TMap 重排，任何 FVoxelChunk* 键都会失效
-		const FIntVector2 NeighborChunkCoord{ SectionCoords[i].X, SectionCoords[i].Y };
-		if (Chunks.Contains(NeighborChunkCoord))
-		{
-			DirtySections.FindOrAdd(NeighborChunkCoord).AddUnique(SectionCoords[i]);
-		}
+		UE_LOG(LogTemp, Warning, TEXT("未指定默认体素生成器"));
 	}
 }
 
-void AVoxelTerrainActor::RebuildDirtySections(int32 MaxCount)
+void AVoxelTerrainActor::RunGenerator(TSubclassOf<UVoxelGenerator> GeneratorClass)
 {
-	int32 Budget = MaxCount <= 0 ? TNumericLimits<int32>::Max() : MaxCount;
-	for (auto It = DirtySections.CreateIterator(); It && Budget > 0;)
+	const UVoxelGenerator* Generator = GeneratorClass ? GeneratorClass->GetDefaultObject<UVoxelGenerator>() : nullptr;
+	if (!Generator)
 	{
-		FVoxelChunk* Chunk = Chunks.Find(It->Key);
-		TArray<FIntVector>& Pending = It->Value;
-
-		while (Pending.Num() > 0 && Budget > 0)
-		{
-			const FIntVector SectionCoord = Pending.Pop();
-			if (Chunk)
-			{
-				Chunk->BuildMesh(this, SectionCoord.Z);
-			}
-			--Budget;
-		}
-
-		// 只有处理干净了才摘掉这一项，预算用尽时剩下的留给下一帧
-		if (Pending.Num() == 0)
-		{
-			It.RemoveCurrent();
-		}
+		UE_LOG(LogTemp, Warning, TEXT("体素生成器无效，跳过生成"));
+		return;
 	}
+
+	Generator->GenerateVoxel(this);
 }
 
-void AVoxelTerrainActor::RebuildAllSections()
+#if WITH_EDITOR
+void AVoxelTerrainActor::EditorRunDefaultGenerator()
+{
+	// CallInEditor 外层已有事务，Modify() 让被改到的 UPROPERTY 状态可撤销
+	Modify();
+	RunDefaultGenerator();
+	BuildMeshesInEditor(true);
+	MarkPackageDirty();
+}
+
+void AVoxelTerrainActor::EditorClearTerrain()
+{
+	Modify();
+	ClearTerrain();
+	MarkPackageDirty();
+}
+
+void AVoxelTerrainActor::EditorRebuildAllSections()
+{
+	BuildMeshesInEditor(true);
+}
+#endif
+
+void AVoxelTerrainActor::BuildAllMeshes()
 {
 	// 直接重建所有 Section：脏区队列在"数据没变"时是空的，光靠它无法把被销毁的网格组件恢复回来。
 	// 空 Section 会在 BuildMeshData 里立刻返回，代价可以接受。
@@ -358,14 +319,17 @@ void AVoxelTerrainActor::RebuildAllSections()
 	}
 }
 
-void AVoxelTerrainActor::ClearTerrain()
+void AVoxelTerrainActor::BuildMeshesInEditor(bool bForced)
 {
-	DirtySections.Reset();
-	for (auto& [ChunkCoord, Chunk] : Chunks)
+	if (bNeedsMeshBuild || bForced)
 	{
-		Chunk.ClearAllMeshes();
+		UAssetManager::CallOrRegister_OnCompletedInitialScan(
+			FSimpleMulticastDelegate::FDelegate::CreateWeakLambda(this, [this]()
+				{
+					bNeedsMeshBuild = false;
+					BuildAllMeshes();
+				}));
 	}
-	Chunks.Reset();
 }
 
 bool AVoxelTerrainActor::LineSingleTraceVoxel(const FVector& Start, const FVector& End, FVoxelTraceHit& OutHit)
@@ -426,9 +390,10 @@ bool AVoxelTerrainActor::LineSingleTraceVoxel(const FVector& Start, const FVecto
 		{
 			break; // 超出线段范围
 		}
-		if (P0.X < MinHeight || P0.X >= MaxHeight ||
-			P0.Y < MinHeight || P0.Y >= MaxHeight ||
-			P0.Z < MinHeight || P0.Z >= MaxHeight)
+		// 只看当前格子的 Z：XY 方向地形是无限铺的，没有范围可言。
+		// （原来这里判的是起点 P0 的 X/Y/Z 与高度范围比较 —— P0 全程不变，而局部 X/Y 只要大于 MaxHeight
+		//  就会立刻 break，导致这条 DDA 几乎走不出第二格）
+		if (Coord.Z < MinHeight || Coord.Z >= MaxHeight)
 		{
 			break; // 超出高度范围
 		}
@@ -436,30 +401,15 @@ bool AVoxelTerrainActor::LineSingleTraceVoxel(const FVector& Start, const FVecto
 	return false;
 }
 
-void AVoxelTerrainActor::PostRegisterAllComponents()
-{
-	Super::PostRegisterAllComponents();
-
-#if WITH_EDITOR
-
-	// 编辑器世界不跑 BeginPlay，补建只能挂在这里；游戏/PIE 统一交给 BeginPlay，免得重建两遍。
-	// （对象复制不会带上 bNeedsMeshBuild 这个 C++ 成员，所以 PIE 必须靠 BeginPlay 兜底）
-	const UWorld* World = GetWorld();
-	if (!World || (World->WorldType != EWorldType::Editor && World->WorldType != EWorldType::EditorPreview))
-	{
-		return;
-	}
-
-	BuildMeshesIfNeeded();
-#endif
-}
-
 void AVoxelTerrainActor::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// 运行时一律保证网格与体素一致：数据可能是存档带进来的，也可能是生成器刚写的
-	RebuildAllSections();
+	// 运行时一律保证网格与体素一致：数据可能是存档带进来的，也可能是生成器刚写的。
+	// 导航数据是派生数据、不入档（NavData 不是 UPROPERTY），所以每次都要在这里重烘一遍；
+	// 它只读体素和场景里的阻碍物，跟网格组件没关系，放在 BuildAllMeshes 前后都行
+	BuildAllMeshes();
+	BuildNavData();
 
 	if (bRunGeneratorOnBeginPlay)
 	{
@@ -477,20 +427,59 @@ void AVoxelTerrainActor::Tick(float DeltaTime)
 	}
 }
 
-void AVoxelTerrainActor::BuildMeshesIfNeeded()
+void AVoxelTerrainActor::PostRegisterAllComponents()
 {
-	if (!bNeedsMeshBuild)
+	Super::PostRegisterAllComponents();
+
+#if WITH_EDITOR
+
+	// 编辑器世界不跑 BeginPlay，补建只能挂在这里；游戏/PIE 统一交给 BeginPlay，免得重建两遍。
+	// （对象复制不会带上 bNeedsMeshBuild 这个 C++ 成员，所以 PIE 必须靠 BeginPlay 兜底）
+	const UWorld* World = GetWorld();
+	if (!World || (World->WorldType != EWorldType::Editor && World->WorldType != EWorldType::EditorPreview))
 	{
 		return;
 	}
 
-	UAssetManager::CallOrRegister_OnCompletedInitialScan(
-		FSimpleMulticastDelegate::FDelegate::CreateWeakLambda(this, [this]()
-			{
-				bNeedsMeshBuild = false;
-				RebuildAllSections();
-			}));
+	BuildMeshesInEditor();
+#endif
 }
+
+void AVoxelTerrainActor::Serialize(FArchive& Ar)
+{
+	// 对象复制（进 PIE / 复制 Actor）和撤销记录不是包体 IO，那种场合数据本来就整体拷贝。
+	const bool bIsPackageIO = Ar.IsPersistent()
+		&& !Ar.HasAnyPortFlags(PPF_Duplicate | PPF_DuplicateForPIE) && !Ar.IsTransacting();
+
+	Super::Serialize(Ar);
+
+	if (Ar.IsLoading() && bIsPackageIO)
+	{
+		DirtySections.Reset();
+#if WITH_EDITOR
+		bNeedsMeshBuild = !Chunks.IsEmpty();
+#endif
+	}
+}
+
+#if WITH_EDITOR
+bool AVoxelTerrainActor::CanEditChange(const FProperty* InProperty) const
+{
+	if (InProperty && !Chunks.IsEmpty())
+	{
+		// 这三项决定了体素尺度与 Section 的划分，有数据之后再改会让已存的体素和网格整体错位
+		const FName Name = InProperty->GetFName();
+		if (Name == GET_MEMBER_NAME_CHECKED(AVoxelTerrainActor, VoxelSize) ||
+			Name == GET_MEMBER_NAME_CHECKED(AVoxelTerrainActor, MinHeight) ||
+			Name == GET_MEMBER_NAME_CHECKED(AVoxelTerrainActor, MaxHeight))
+		{
+			return false;
+		}
+	}
+
+	return Super::CanEditChange(InProperty);
+}
+#endif
 
 TPair<FIntVector, FIntVector> AVoxelTerrainActor::WorldCoordToChunkLocalCoord(const FIntVector& WorldCoord)
 {
