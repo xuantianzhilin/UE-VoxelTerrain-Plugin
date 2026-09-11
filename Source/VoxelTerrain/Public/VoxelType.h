@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Engine/DataAsset.h"
+#include "Materials/MaterialInterface.h"
 #include "VoxelType.generated.h"
 
 

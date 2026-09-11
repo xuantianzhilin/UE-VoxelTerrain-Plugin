@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "UObject/NoExportTypes.h"
+#include "Templates/SubclassOf.h"
 #include "VoxelNavLinkProxy.generated.h"
 
 class AVoxelTerrainActor;
@@ -11,11 +12,11 @@ struct FVoxelNavLinkProxyData
 {
 	GENERATED_BODY()
 
-	UPROPERTY(EditAnywhere)
+	UPROPERTY(EditAnywhere, Category = "Voxel|Navigation")
 	FIntVector StartCoord = FIntVector::ZeroValue;
-	UPROPERTY(EditAnywhere)
+	UPROPERTY(EditAnywhere, Category = "Voxel|Navigation")
 	FIntVector Destination = FIntVector::ZeroValue;
-	UPROPERTY(EditAnywhere)
+	UPROPERTY(EditAnywhere, Category = "Voxel|Navigation")
 	TSubclassOf<UVoxelNavLinkProxy> ProxyClass;
 
 	bool operator==(const FVoxelNavLinkProxyData& Other) const

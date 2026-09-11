@@ -352,6 +352,7 @@ void AVoxelTerrainActor::BuildAllMeshes()
 	}
 }
 
+#if WITH_EDITOR
 void AVoxelTerrainActor::BuildMeshesInEditor(bool bForced)
 {
 	if (bNeedsMeshBuild || bForced)
@@ -364,6 +365,7 @@ void AVoxelTerrainActor::BuildMeshesInEditor(bool bForced)
 				}));
 	}
 }
+#endif
 
 bool AVoxelTerrainActor::LineSingleTraceVoxel(const FVector& Start, const FVector& End, FVoxelTraceHit& OutHit)
 {
