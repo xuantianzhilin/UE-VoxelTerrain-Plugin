@@ -229,12 +229,16 @@ void AVoxelTerrainActor::ConfigureAutoNavLinks(bool bEnable, TSubclassOf<UVoxelN
 void AVoxelTerrainActor::AddLinkProxy(const FVoxelNavLinkProxyData& ProxyData)
 {
 	LinkData.Add(ProxyData);
-	RebuildLinksAround(ProxyData);
+
+	if (GetWorld() && GetWorld()->IsGameWorld())
+	{
+		RebuildLinksAround(ProxyData);
+	}
 }
 
 void AVoxelTerrainActor::RemoveLinkProxy(const FVoxelNavLinkProxyData& ProxyData)
 {
-	if (LinkProxyRecords.Remove(ProxyData) > 0)
+	if (LinkProxyRecords.Remove(ProxyData) > 0 && GetWorld() && GetWorld()->IsGameWorld())
 	{
 		RebuildLinksAround(ProxyData);
 	}
@@ -251,10 +255,7 @@ void AVoxelTerrainActor::RebuildLinksAround(const FVoxelNavLinkProxyData& ProxyD
 	// 否则得等到有人改体素把它标脏才生效。这里只重烘导航，不动网格（网格跟连接无关）
 	for (const FIntVector& EndPoint : { ProxyData.StartCoord, ProxyData.Destination })
 	{
-		const FIntVector SectionCoord{
-			Voxel::FloorDivide(EndPoint.X, Voxel::LENGTH),
-			Voxel::FloorDivide(EndPoint.Y, Voxel::LENGTH),
-			Voxel::FloorDivide(EndPoint.Z, Voxel::LENGTH) };
+		const FIntVector SectionCoord = GetSectionCoordFromWorldCoord(EndPoint);
 		if (FVoxelSection* Section = GetChunkSection(SectionCoord))
 		{
 			Section->BuildNavData(this);
