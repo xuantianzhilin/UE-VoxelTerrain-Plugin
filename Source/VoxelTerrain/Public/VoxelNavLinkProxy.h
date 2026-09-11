@@ -12,9 +12,9 @@ struct FVoxelNavLinkProxyData
 	GENERATED_BODY()
 
 	UPROPERTY(EditAnywhere)
-	FIntVector StartCoord;
+	FIntVector StartCoord = FIntVector::ZeroValue;
 	UPROPERTY(EditAnywhere)
-	FIntVector Destination;
+	FIntVector Destination = FIntVector::ZeroValue;
 	UPROPERTY(EditAnywhere)
 	TSubclassOf<UVoxelNavLinkProxy> ProxyClass;
 
