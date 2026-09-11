@@ -5,6 +5,7 @@
 #include "VoxelChunk.generated.h"
 
 class UVoxelType;
+class UVoxelNavLinkProxy;
 class AVoxelTerrainActor;
 
 namespace Voxel
@@ -51,22 +52,38 @@ struct FVoxelMeshData
 	UMaterialInterface* Material = nullptr;
 };
 
-/** 一条导航连接：从某个落脚格指向水平 4 邻里的另一个落脚格（邻格可能属于相邻 Section） */
+/**
+ * 一条导航连接：从某个落脚格指向另一个落脚格（目标可能在相邻 Section，手动连接甚至可以很远）。
+ * 两种走法，ProxyClass 是唯一的分界：
+ *   - ProxyClass 为空：平面连接，同一层且水平相邻，UVoxelPathFollowingComponent 自己插值走过去。
+ *   - ProxyClass 非空：非平面连接（高差不同 / 不相邻），必须由这个代理把 Agent 挪到目标格。
+ */
 struct FVoxelNavLink
 {
 	/** 目标格所属的 Section（Section 单位坐标） */
 	FIntVector OwnnerSection;
 	/** 目标格在该 Section 内的局部体素坐标（0 ~ Voxel::LENGTH-1） */
 	FIntVector LinkCoord;
+
+	/** 非平面连接的驱动者；为空表示这是一条可以直接走的平面连接 */
+	TSubclassOf<UVoxelNavLinkProxy> ProxyClass;
 };
 
-/** 一个落脚格：本格自己的净空 + 到水平 4 邻的连接 */
+/**
+ * 一个落脚格：本格自己的净空 + 到水平 4 邻的连接。
+ *
+ * 限制：整张导航图是按「AI 占地 1 格」烘的。AllowHeight 只数本格这一列，横向相邻的格（含 90° 拐角
+ * 会被身体扫到的那格）有没有被挡完全没查，所以占地 > 1 格的 AI 在这里会看到假通路：
+ * 1 格宽的隘口、旁边就是墙的落脚格、拐角处的对角格，全都算走得通。
+ * 一格 = VoxelSize（默认 100，即 1 米），胶囊半径 40 上下的人形 AI 占 1 格是准确的；
+ * 要做更宽的体型，必须在烘焙里按半径分档记录净空（见 AVoxelTerrainActor::FindPath 的说明），查询期补不出来。
+ */
 struct FVoxelNavCell
 {
-	/** 本格能通过的最高 AI（体素单位）：从本格起向上数连续的净空格数，与旧寻路的 AgentHeight 同义。
+	/** 本格能通过的最高 AI（体素单位）：从本格起向上数连续的净空格数，只看本格这一列，与旧寻路的 AgentHeight 同义。
 	 *  数到 AVoxelTerrainActor::GetMaxAllowHeight() 格就封顶，取到该值只表示“至少这么高” */
 	int32 AllowHeight = 0;
-	/** 走得通的邻格：只含水平 4 邻，且与本格高度差在 FVoxelSection::LinkHeight 内（净空由对方那条记录自己给） */
+	/** 走得通的邻格：平面连接只含同层水平 4 邻；高差不同或不相邻的得靠代理连接（见 FVoxelNavLink） */
 	TArray<FVoxelNavLink> Links;
 };
 
@@ -95,7 +112,9 @@ public:
 	/**
 	 * 烘焙本 Section 的导航数据到 NavData（每次调用整体重建本 Section 的部分）。
 	 * 节点是"落脚格"：自身为空、下方有支撑（体素或被静态网格体等外部阻碍占据的格都算支撑）。
-	 * 连接规则：只连水平 4 邻，且两格高度差在 LinkHeight 内；骨骼网格体不参与烘焙。
+	 * 连接规则：平面连接只连同层水平 4 邻；高差在 NavLinkMaxHeightDiff 内的相邻格由 bAutoSpawNavLink 自动
+	 * 挂上 NavLinkProxyClass；更远或跨层的连接由 AddLinkProxy 手动挂。骨骼网格体不参与烘焙。
+	 * 烘出来的图服务的是「占地 1 格」的 AI：只判落脚点自身这一列的空位与支撑，不判身体横向占掉的其它格（见 FVoxelNavCell）。
 	 * Key = 落脚格在本 Section 内的局部坐标，Value 见 FVoxelNavCell；链接目标可能落在相邻 Section。
 	 * 注意：外扩一圈只为判定边界格与邻格，本函数不会写入相邻 Section 的数据（那边烘焙自己的）。
 	 */
@@ -114,7 +133,7 @@ private:
 	uint32 FindOrAddPalenteIndex(FVoxelState State);
 
 	UPROPERTY()
-	FIntVector SectionCoord;
+	FIntVector SectionCoord = FIntVector::ZeroValue;
 	UPROPERTY()
 	int32 BitsPerVoxel = 0;			// 每个体素的位数，0表示单值模式，>0表示调色板模式
 	UPROPERTY()
@@ -127,8 +146,6 @@ private:
 	/* 导航数据：Key = 本 Section 内的落脚格局部坐标，Value = 该格的净空与到水平 4 邻的连接。
 	   只由 BuildNavData 生成（未烘焙时为空），是派生数据，不参与序列化 */
 	TMap<FIntVector, FVoxelNavCell> NavData;
-
-	static constexpr int32 LinkHeight = 1;
 };
 
 USTRUCT()
@@ -166,7 +183,7 @@ private:
 	UProceduralMeshComponent* FindOrAddChunkMeshComponent(AVoxelTerrainActor* Terrain, int32 Index);
 
 	UPROPERTY()
-	FIntVector2 ChunkCoord;
+	FIntVector2 ChunkCoord = FIntVector2::ZeroValue;
 	UPROPERTY()
 	int32 BaseSectionZ = 0;			// 本 Chunk 第一个 Section 的全局 Z 索引 = MinHeight / LENGTH（默认构造必须归零，否则 LogClass 会报未初始化）
 	UPROPERTY()

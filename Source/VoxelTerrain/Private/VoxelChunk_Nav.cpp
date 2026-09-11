@@ -261,13 +261,22 @@ void FVoxelSection::BuildNavData(const AVoxelTerrainActor* Terrain)
 		return;
 	}
 
-	// 落脚判定用的窄带：本 Section 外扩一圈，X/Y 各 ±1 覆盖水平 4 邻格，
-	// Z 下扩 LinkHeight+1 覆盖邻格的支撑格（判断“可站立”要往下看一格），上扩 LinkHeight 覆盖台阶。
-	// 净空只从落脚格向上数 MaxAllowHeight 格，所以查询区域只要铺到最高落脚格之上这么多格即可。
+	/* 连接分两类，正好对应移动的两套驱动：
+	   - 平面连接：同一层、水平相邻。UVoxelPathFollowingComponent 自己插值走过去。
+	   - 非平面连接：高度不同或不相邻。这类必须挂一个 UVoxelNavLinkProxy，由它把人挪到对面去。
+	   自动连接（bAutoSpawNavLink）负责把「高差在 NavLinkMaxHeightDiff 内的相邻格」用
+	   DefaultLinkProxy 连起来；手动连接走 AddLinkProxy，两端距离不限。 */
 	const int32 MaxAllowHeight = Terrain->GetMaxAllowHeight();
+	const bool bAutoLinks = Terrain->ShouldAutoSpawnNavLinks();
+	const int32 LinkReachZ = bAutoLinks ? Terrain->GetNavLinkMaxHeightDiff() : 0;
+	const TSubclassOf<UVoxelNavLinkProxy> AutoProxyClass = bAutoLinks ? Terrain->GetAutoNavLinkProxyClass() : nullptr;
+
 	const FIntVector SectionOrigin = SectionCoord * LENGTH;
-	const int32 BottomZ = SectionOrigin.Z - (LinkHeight + 1);
-	const int32 HighestStandableZ = SectionOrigin.Z + LENGTH + LinkHeight;					// 邻格可能站到的最高一层
+	// 落脚判定用的窄带：本 Section 外扩一圈，X/Y 各 ±1 覆盖水平 4 邻格，
+	// Z 下扩 LinkReachZ+1 覆盖邻格的支撑格（判断“可站立”要往下看一格），上扩 LinkReachZ 覆盖台阶。
+	// 净空只从落脚格向上数 MaxAllowHeight 格，所以查询区域只要铺到最高落脚格之上这么多格即可。
+	const int32 BottomZ = SectionOrigin.Z - (LinkReachZ + 1);
+	const int32 HighestStandableZ = SectionOrigin.Z + LENGTH + LinkReachZ;					// 邻格可能站到的最高一层
 	const int32 TopZ = FMath::Max(HighestStandableZ, SectionOrigin.Z + LENGTH - 1 + MaxAllowHeight - 1);
 
 	const int32 XYSize = LENGTH + 2;
@@ -305,7 +314,65 @@ void FVoxelSection::BuildNavData(const AVoxelTerrainActor* Terrain)
 			return !Grid.IsSolid(Coord) && Grid.IsSolid(Coord - FIntVector(0, 0, 1));
 		};
 
-	// 3) 每个落脚格只连接水平 4 邻：邻格与自己的高度差在 LinkHeight 内即视为相邻（可以上/下一格台阶）
+	auto GlobalToLocalSection = [](const FIntVector& Coord)
+		{
+			return FIntVector(FloorDivide(Coord.X, LENGTH), FloorDivide(Coord.Y, LENGTH), FloorDivide(Coord.Z, LENGTH));
+		};
+
+	// 写一条连接（同一条重复写会被忽略：手动连接可能与自动连接落在同一对格子上）
+	auto AddLink = [&GlobalToLocalSection](FVoxelNavCell& Cell, const FIntVector& Target, TSubclassOf<UVoxelNavLinkProxy> ProxyClass)
+		{
+			const FIntVector TargetSection = GlobalToLocalSection(Target);
+			const FIntVector TargetLocal = Target - TargetSection * LENGTH;
+			for (const FVoxelNavLink& Existing : Cell.Links)
+			{
+				if (Existing.OwnnerSection == TargetSection && Existing.LinkCoord == TargetLocal)
+				{
+					return;
+				}
+			}
+			FVoxelNavLink& Link = Cell.Links.AddDefaulted_GetRef();
+			Link.OwnnerSection = TargetSection;
+			Link.LinkCoord = TargetLocal;
+			Link.ProxyClass = ProxyClass;
+		};
+
+	// 3) 手动连接先按「端点是否落在本 Section」分两堆：作为起点（正着连）与作为终点（非单向时反向补一条）
+	auto IsInThisSection = [SectionOrigin](const FIntVector& Coord)
+		{
+			return Coord.X >= SectionOrigin.X && Coord.X < SectionOrigin.X + LENGTH
+				&& Coord.Y >= SectionOrigin.Y && Coord.Y < SectionOrigin.Y + LENGTH
+				&& Coord.Z >= SectionOrigin.Z && Coord.Z < SectionOrigin.Z + LENGTH;
+		};
+	auto IsOneWay = [](TSubclassOf<UVoxelNavLinkProxy> ProxyClass)
+		{
+			const UVoxelNavLinkProxy* CDO = ProxyClass ? ProxyClass->GetDefaultObject<UVoxelNavLinkProxy>() : nullptr;
+			return CDO && CDO->bOneWay;
+		};
+
+	const TArray<FVoxelNavLinkProxyData>& AllManualLinks = Terrain->GetLinkProxyData();
+	TMap<FIntVector, TArray<const FVoxelNavLinkProxyData*>> ByStart;
+	TMap<FIntVector, TArray<const FVoxelNavLinkProxyData*>> ByDestination;
+	for (const FVoxelNavLinkProxyData& Data : AllManualLinks)
+	{
+		if (!Data.ProxyClass)
+		{
+			// 没有代理类的非平面连接没法走：不写，免得寻路以为走得通
+			UE_LOG(LogTemp, Warning, TEXT("[Voxel] 手动连接 (%d,%d,%d)->(%d,%d,%d) 没填 ProxyClass，已忽略"),
+				Data.StartCoord.X, Data.StartCoord.Y, Data.StartCoord.Z, Data.Destination.X, Data.Destination.Y, Data.Destination.Z);
+			continue;
+		}
+		if (IsInThisSection(Data.StartCoord))
+		{
+			ByStart.FindOrAdd(Data.StartCoord).Add(&Data);
+		}
+		if (IsInThisSection(Data.Destination))
+		{
+			ByDestination.FindOrAdd(Data.Destination).Add(&Data);
+		}
+	}
+
+	// 4) 逐格出节点与连接
 	static const FIntVector Directions[4] = {
 		FIntVector(1, 0, 0), FIntVector(-1, 0, 0), FIntVector(0, 1, 0), FIntVector(0, -1, 0) };
 
@@ -328,24 +395,49 @@ void FVoxelSection::BuildNavData(const AVoxelTerrainActor* Terrain)
 
 				for (const FIntVector& Direction : Directions)
 				{
-					for (int32 DeltaZ = -LinkHeight; DeltaZ <= LinkHeight; ++DeltaZ)
+					// 平面连接：同层的水平 4 邻，不挂代理
+					const FIntVector Side = Coord + Direction;
+					if (IsStandable(Side))
 					{
-						const FIntVector Neighbor = Coord + Direction + FIntVector(0, 0, DeltaZ);
-						if (!IsStandable(Neighbor))
+						AddLink(Cell, Side, nullptr);
+					}
+
+					// 自动连接：高差在 NavLinkMaxHeightDiff 内的上下台阶，挂自动代理
+					if (bAutoLinks)
+					{
+						for (int32 DeltaZ = 1; DeltaZ <= LinkReachZ; ++DeltaZ)
 						{
-							continue;
+							const FIntVector Up = Side + FIntVector(0, 0, DeltaZ);
+							if (IsStandable(Up))
+							{
+								AddLink(Cell, Up, AutoProxyClass);
+							}
+							const FIntVector Down = Side - FIntVector(0, 0, DeltaZ);
+							if (IsStandable(Down))
+							{
+								AddLink(Cell, Down, AutoProxyClass);
+							}
 						}
+					}
+				}
 
-						// 邻格可能落在相邻 Section：用 (所属 Section, 该 Section 内的局部坐标) 定位它，
-						// 它自己的净空读它那条记录（NavData[LinkCoord].AllowHeight）
-						const FIntVector NeighborSection{
-							FloorDivide(Neighbor.X, LENGTH),
-							FloorDivide(Neighbor.Y, LENGTH),
-							FloorDivide(Neighbor.Z, LENGTH) };
-
-						FVoxelNavLink& Link = Cell.Links.AddDefaulted_GetRef();
-						Link.OwnnerSection = NeighborSection;
-						Link.LinkCoord = Neighbor - NeighborSection * LENGTH;
+				// 手动连接：另一端可能在本 Section 之外任意远，所以不校验对方的可站性 ——
+				// 对方没被烘成落脚格时，A* 查询会因为查不到它的记录而自然忽略这条连接
+				if (const TArray<const FVoxelNavLinkProxyData*>* FromHere = ByStart.Find(Coord))
+				{
+					for (const FVoxelNavLinkProxyData* Data : *FromHere)
+					{
+						AddLink(Cell, Data->Destination, Data->ProxyClass);
+					}
+				}
+				if (const TArray<const FVoxelNavLinkProxyData*>* ToHere = ByDestination.Find(Coord))
+				{
+					for (const FVoxelNavLinkProxyData* Data : *ToHere)
+					{
+						if (!IsOneWay(Data->ProxyClass))
+						{
+							AddLink(Cell, Data->StartCoord, Data->ProxyClass);
+						}
 					}
 				}
 			}

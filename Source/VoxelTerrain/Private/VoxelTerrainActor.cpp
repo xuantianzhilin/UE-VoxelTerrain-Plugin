@@ -13,23 +13,6 @@ AVoxelTerrainActor::AVoxelTerrainActor()
 	RootComponent = VoxelRoot;
 }
 
-FIntVector AVoxelTerrainActor::WorldLocationToCoord(const FVector& WorldLocation) const
-{
-	FVector LocalLocation = GetActorTransform().InverseTransformPosition(WorldLocation);
-	LocalLocation /= VoxelSize;
-	const int32 X = FMath::FloorToInt32(LocalLocation.X);
-	const int32 Y = FMath::FloorToInt32(LocalLocation.Y);
-	const int32 Z = FMath::FloorToInt32(LocalLocation.Z);
-	return { X, Y, Z };
-}
-
-FVector AVoxelTerrainActor::CoordToWorldLocation(FIntVector Coord) const
-{
-	static const FVector HalfVoxelSize{ 0.5 };
-	const FVector LocalPos = (FVector{ Coord } + HalfVoxelSize) * VoxelSize;
-	return GetActorTransform().TransformPosition(LocalPos);
-}
-
 void AVoxelTerrainActor::SetVoxel(FIntVector Coord, FName TypeName, const FRotator& Rotation)
 {
 	SetVoxels({ Coord }, TypeName, Rotation);
@@ -47,7 +30,7 @@ void AVoxelTerrainActor::SetVoxels(const TArray<FIntVector>& Coords, FName TypeN
 			continue;
 		}
 
-		const auto [SectionCoord, LocalCoord] = WorldCoordToChunkLocalCoord(Coord);
+		const auto [SectionCoord, LocalCoord] = WorldCoordToSectionLocalCoord(Coord);
 		FVoxelChunk& Chunk = FindOrAddChunk(FIntVector2{ SectionCoord });
 		if (FVoxelSection* Section = Chunk.GetSection(SectionCoord.Z))
 		{
@@ -71,6 +54,60 @@ void AVoxelTerrainActor::SetVoxels(const TArray<FIntVector>& Coords, FName TypeN
 	}
 }
 
+FVoxelState AVoxelTerrainActor::GetVoxel(FIntVector Coord) const
+{
+	const auto [SectionCoord, LocalCoord] = WorldCoordToSectionLocalCoord(Coord);
+	const FVoxelChunk* Chunk = Chunks.Find(FIntVector2{ SectionCoord });
+	const FVoxelSection* Section = Chunk ? Chunk->GetSection(SectionCoord.Z) : nullptr;
+	return Section ? Section->GetVoxel(LocalCoord) : FVoxelState{};
+}
+
+FIntVector AVoxelTerrainActor::WorldLocationToCoord(const FVector& WorldLocation) const
+{
+	FVector LocalLocation = GetActorTransform().InverseTransformPosition(WorldLocation);
+	LocalLocation /= VoxelSize;
+	const int32 X = FMath::FloorToInt32(LocalLocation.X);
+	const int32 Y = FMath::FloorToInt32(LocalLocation.Y);
+	const int32 Z = FMath::FloorToInt32(LocalLocation.Z);
+	return { X, Y, Z };
+}
+
+FVector AVoxelTerrainActor::CoordToWorldLocation(FIntVector Coord) const
+{
+	static const FVector HalfVoxelSize{ 0.5 };
+	const FVector LocalPos = (FVector{ Coord } + HalfVoxelSize) * VoxelSize;
+	return GetActorTransform().TransformPosition(LocalPos);
+}
+
+TPair<FIntVector, FIntVector> AVoxelTerrainActor::WorldCoordToSectionLocalCoord(const FIntVector& WorldCoord)
+{
+	const FIntVector SectionCoord{ GetSectionCoordFromWorldCoord(WorldCoord) };
+
+	const FIntVector LocalCoord{
+		WorldCoord.X - SectionCoord.X * Voxel::LENGTH,
+		WorldCoord.Y - SectionCoord.Y * Voxel::LENGTH,
+		WorldCoord.Z - SectionCoord.Z * Voxel::LENGTH };
+
+	return { SectionCoord, LocalCoord };
+}
+
+FIntVector AVoxelTerrainActor::SectionLocalCoordToWorldCoord(const FIntVector& SectionCoord, const FIntVector& LocalCoord)
+{
+	return {
+		SectionCoord.X * Voxel::LENGTH + LocalCoord.X,
+		SectionCoord.Y * Voxel::LENGTH + LocalCoord.Y,
+		SectionCoord.Z * Voxel::LENGTH + LocalCoord.Z
+	};
+}
+
+FIntVector AVoxelTerrainActor::GetSectionCoordFromWorldCoord(const FIntVector& WorldCoord)
+{
+	return {
+		Voxel::FloorDivide(WorldCoord.X, Voxel::LENGTH),
+		Voxel::FloorDivide(WorldCoord.Y, Voxel::LENGTH),
+		Voxel::FloorDivide(WorldCoord.Z, Voxel::LENGTH) };
+}
+
 void AVoxelTerrainActor::MarkSectionDirty(FIntVector SectionCoord, FIntVector LocalCoord)
 {
 	// 本 Section 必然要重建；改动落在边界上时，相邻 Section 的遮挡判断结果也会变，同样要重建
@@ -81,16 +118,17 @@ void AVoxelTerrainActor::MarkSectionDirty(FIntVector SectionCoord, FIntVector Lo
 			SectionCoords[Num++] = SectionCoord + Offset;
 		};
 
-	if (LocalCoord.X == 0)					AddNeighbor({ -1, 0, 0 });
-	if (LocalCoord.X == Voxel::LENGTH - 1)	AddNeighbor({ 1, 0, 0 });
-	if (LocalCoord.Y == 0)					AddNeighbor({ 0, -1, 0 });
-	if (LocalCoord.Y == Voxel::LENGTH - 1)	AddNeighbor({ 0, 1, 0 });
-	// 净空（AllowHeight）是从落脚格向上数的：改了某一体素，同列上"向上扫得到它"的那些落脚格就全要重算，
-	// 那些格子都在改动处之下、最远差 MaxAllowHeight-1 格，所以贴着底部时得连下方 Section 一起重烘。
-	// 严格的条件是 Z < MaxAllowHeight - 1，这里取 < MaxAllowHeight 多标一行（宁滥勿漏）；
-	// 封顶值被夹在一层（Voxel::LENGTH）以内，故牵连范围不会超过下方一个 Section
-	if (LocalCoord.Z < GetMaxAllowHeight())	AddNeighbor({ 0, 0, -1 });
-	if (LocalCoord.Z == Voxel::LENGTH - 1)	AddNeighbor({ 0, 0, 1 });
+	if (LocalCoord.X == 0)										AddNeighbor({ -1, 0, 0 });
+	if (LocalCoord.X == Voxel::LENGTH - 1)						AddNeighbor({ 1, 0, 0 });
+	if (LocalCoord.Y == 0)										AddNeighbor({ 0, -1, 0 });
+	if (LocalCoord.Y == Voxel::LENGTH - 1)						AddNeighbor({ 0, 1, 0 });
+	// 净空（AllowHeight）是从落脚格向上数的：改了某一体素，同列上「向上扫得到它」的那些落脚格就全要重算，
+	// 它们都在改动处之下、最远差 MaxAllowHeight-1 格，所以贴着底部时得连下方 Section 一起重烘。
+	// 自动连接同理：高差在 NavLinkMaxHeightDiff 内的连接，两端可以分别落在上下两层 Section 里，
+	// 所以两个方向都按 GetNavZReach() 放宽（严格来说每边还能再窄一格，这里多标一行，宁滥勿漏）。
+	// 两个上限都被夹在一层（Voxel::LENGTH）以内，故牵连范围不会超过上下各一个 Section
+	if (LocalCoord.Z < GetMaxImpactHeight())					AddNeighbor({ 0, 0, -1 });
+	if (LocalCoord.Z >= Voxel::LENGTH - GetMaxImpactHeight())	AddNeighbor({ 0, 0, 1 });
 	// Z 方向相邻 Section 必然属于同一个 Chunk（Chunk 只按 X/Y 划分），超出高度范围时 BuildMesh/BuildNavData 内部会跳过
 
 	for (int32 i = 0; i < Num; ++i)
@@ -132,14 +170,6 @@ void AVoxelTerrainActor::RebuildDirtySections(int32 MaxCount)
 	}
 }
 
-FVoxelState AVoxelTerrainActor::GetVoxel(FIntVector Coord) const
-{
-	const auto [SectionCoord, LocalCoord] = WorldCoordToChunkLocalCoord(Coord);
-	const FVoxelChunk* Chunk = Chunks.Find(FIntVector2{ SectionCoord });
-	const FVoxelSection* Section = Chunk ? Chunk->GetSection(SectionCoord.Z) : nullptr;
-	return Section ? Section->GetVoxel(LocalCoord) : FVoxelState{};
-}
-
 void AVoxelTerrainActor::ClearTerrain()
 {
 	DirtySections.Reset();
@@ -150,6 +180,9 @@ void AVoxelTerrainActor::ClearTerrain()
 	}
 	Chunks.Reset();
 	NavWeights.Reset();
+	LinkData.Reset();
+	LinkProxyRecords.Reset();
+	CoordRecords.Reset();
 #if WITH_EDITOR
 	// 数据都清了就不该再留"要补建网格"的标记：否则编辑器里下一次 PostRegisterAllComponents
 	// 会挂着 AssetManager 回调对着空 Chunks 跑一遍全量重建
@@ -405,9 +438,6 @@ void AVoxelTerrainActor::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// 运行时一律保证网格与体素一致：数据可能是存档带进来的，也可能是生成器刚写的。
-	// 导航数据是派生数据、不入档（NavData 不是 UPROPERTY），所以每次都要在这里重烘一遍；
-	// 它只读体素和场景里的阻碍物，跟网格组件没关系，放在 BuildAllMeshes 前后都行
 	BuildAllMeshes();
 	BuildNavData();
 
@@ -480,22 +510,6 @@ bool AVoxelTerrainActor::CanEditChange(const FProperty* InProperty) const
 	return Super::CanEditChange(InProperty);
 }
 #endif
-
-TPair<FIntVector, FIntVector> AVoxelTerrainActor::WorldCoordToChunkLocalCoord(const FIntVector& WorldCoord)
-{
-	// 体素坐标 -> Section 坐标 + Section 内体素坐标，FloorDivide 保证负坐标向 -inf 取整
-	const FIntVector SectionCoord{
-		Voxel::FloorDivide(WorldCoord.X, Voxel::LENGTH),
-		Voxel::FloorDivide(WorldCoord.Y, Voxel::LENGTH),
-		Voxel::FloorDivide(WorldCoord.Z, Voxel::LENGTH) };
-
-	const FIntVector LocalCoord{
-		WorldCoord.X - SectionCoord.X * Voxel::LENGTH,
-		WorldCoord.Y - SectionCoord.Y * Voxel::LENGTH,
-		WorldCoord.Z - SectionCoord.Z * Voxel::LENGTH };
-
-	return { SectionCoord, LocalCoord };
-}
 
 FVoxelChunk& AVoxelTerrainActor::FindOrAddChunk(FIntVector2 ChunkCoord)
 {

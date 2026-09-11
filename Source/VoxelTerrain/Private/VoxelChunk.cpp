@@ -250,7 +250,7 @@ FVoxelChunk::FVoxelChunk(FIntVector2 InChunkCoord, int32 InMinHeight, int32 InMa
 	checkf(Height % LENGTH == 0, TEXT("Height must be a multiple of Voxel::LENGTH"));
 	checkf(InMinHeight % LENGTH == 0, TEXT("MinHeight must be a multiple of Voxel::LENGTH to locate a section"));
 	Sections.Reserve(NumSections);
-	for (int32 Z = BaseSectionZ; Z < NumSections; ++Z)
+	for (int32 Z = BaseSectionZ; Z < BaseSectionZ + NumSections; ++Z)
 	{
 		Sections.Emplace(FIntVector{ ChunkCoord.X, ChunkCoord.Y, Z });
 	}

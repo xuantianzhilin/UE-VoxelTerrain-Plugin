@@ -3,9 +3,11 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "VoxelChunk.h"
+#include "VoxelNavLinkProxy.h"
 #include "VoxelTerrainActor.generated.h"
 
 class UVoxelGenerator;
+struct FVoxelPathPoint;
 class UProceduralMeshComponent;
 
 namespace Voxel
@@ -27,11 +29,11 @@ struct FVoxelTraceHit
 	UPROPERTY(BlueprintReadOnly, Category = "Voxel")
 	bool bHit = false;
 	UPROPERTY(BlueprintReadOnly, Category = "Voxel")
-	FIntVector Coord;
+	FIntVector Coord = FIntVector::ZeroValue;
 	UPROPERTY(BlueprintReadOnly, Category = "Voxel")
-	FVector Normal;
+	FVector Normal = FVector::ZeroVector;
 	UPROPERTY(BlueprintReadOnly, Category = "Voxel")
-	FVector ImpactPoint;
+	FVector ImpactPoint = FVector::ZeroVector;
 	UPROPERTY(BlueprintReadOnly, Category = "Voxel")
 	FVoxelState Voxel;
 };
@@ -46,16 +48,23 @@ public:
 	AVoxelTerrainActor();
 
 	UFUNCTION(BlueprintCallable, Category = "Voxel")
-	FIntVector WorldLocationToCoord(const FVector& WorldLocation) const;
-	UFUNCTION(BlueprintCallable, Category = "Voxel")
-	FVector CoordToWorldLocation(FIntVector Coord) const;
-	UFUNCTION(BlueprintCallable, Category = "Voxel")
-	const FVector& GetVoxelSize() const { return VoxelSize; }
-
-	UFUNCTION(BlueprintCallable, Category = "Voxel")
 	void SetVoxel(FIntVector Coord, FName TypeName, const FRotator& Rotation = FRotator::ZeroRotator);
 	UFUNCTION(BlueprintCallable, Category = "Voxel")
 	void SetVoxels(const TArray<FIntVector>& Coords, FName TypeName, const FRotator& Rotation = FRotator::ZeroRotator);
+	UFUNCTION(BlueprintCallable, Category = "Voxel")
+	FVoxelState GetVoxel(FIntVector Coord) const;
+	UFUNCTION(BlueprintCallable, Category = "Voxel")
+	const FVector& GetVoxelSize() const { return VoxelSize; }
+
+	UFUNCTION(BlueprintCallable, Category = "Voxel|Coord")
+	FIntVector WorldLocationToCoord(const FVector& WorldLocation) const;
+	UFUNCTION(BlueprintCallable, Category = "Voxel|Coord")
+	FVector CoordToWorldLocation(FIntVector Coord) const;
+	/*将世界坐标转换为Section坐标和Section内本地坐标*/
+	static TPair<FIntVector, FIntVector> WorldCoordToSectionLocalCoord(const FIntVector& WorldCoord);
+	static FIntVector SectionLocalCoordToWorldCoord(const FIntVector& SectionCoord, const FIntVector& LocalCoord);
+	UFUNCTION(BlueprintCallable, Category = "Voxel|Coord")
+	static FIntVector GetSectionCoordFromWorldCoord(const FIntVector& WorldCoord);
 
 	/*重建该 Section 的网格与导航数据；编辑处落在边界上时，相邻 Section 的遮挡/连接也会变，一并标脏*/
 	UFUNCTION(BlueprintCallable, Category = "Voxel")
@@ -63,9 +72,6 @@ public:
 	/*按预算消化脏区：每个脏 Section 同时重建网格与导航数据（MaxCount<=0 表示不限数量）*/
 	UFUNCTION(BlueprintCallable, Category = "Voxel")
 	void RebuildDirtySections(int32 MaxCount = 0);
-
-	UFUNCTION(BlueprintCallable, Category = "Voxel")
-	FVoxelState GetVoxel(FIntVector Coord) const;
 
 	/*清地形：销毁网格组件、丢掉 Chunk（连带其导航数据）与刷过的区域权重*/
 	UFUNCTION(BlueprintCallable, Category = "Voxel")
@@ -129,7 +135,7 @@ public:
 	/** 净空统计的格数上限：落脚格向上数这么多格还没被挡，就按“至少这么高”封顶（见 FVoxelNavCell::AllowHeight）。
 	 *  刻意夹在 [1, Voxel::LENGTH]：净空是向上看的，不超过一层，改一体素时才只需连下方那一层一起重烘 */
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
-	int32 GetMaxAllowHeight() const { return FMath::Clamp(MaxAllowHeight, 1, Voxel::LENGTH); }
+	int32 GetMaxAllowHeight() const { return FMath::Clamp(MaxAllowHeight, 1, Voxel::LENGTH - 1); }
 
 	/*全量烘焙所有 Section 的导航数据（BeginPlay 已经调过一次；运行期改体素走脏区局部重建）*/
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
@@ -138,37 +144,52 @@ public:
 	/* 区域通行权重：查询期数据，不参与烘焙（刷权重不需要重烘，烘焙也不读它）。
 	   1=正常，>1 更难走，0=软墙（能站但没人绕过来），负数/NaN 拒收；等于 1 的条目不落表 */
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
-	void SetVoxelPathWeight(FIntVector Coord, float Weight);
+	void SetCoordNavWeight(FIntVector Coord, float Weight);
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
-	void ClearVoxelPathWeight(FIntVector Coord);
+	void ClearCoordNavWeight(FIntVector Coord);
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
-	float GetVoxelPathWeight(FIntVector Coord) const;
-	/*闭区间批量刷权重；Weight 传 1 等于清掉这一片的权重*/
+	float GetCoordNavWeight(FIntVector Coord) const;
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
-	void SetVoxelPathWeightBox(FIntVector Min, FIntVector Max, float Weight);
+	void SetCoordNavWeightBox(FIntVector Min, FIntVector Max, float Weight);
+
+
+	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
+	void AddLinkProxy(const FVoxelNavLinkProxyData& ProxyData);
+	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
+	void RemoveLinkProxy(const FVoxelNavLinkProxyData& ProxyData);
+
+	/** 自动连接的开关与参数（烘焙要用；NavLinkMaxHeightDiff 夹在 [1, Voxel::LENGTH]，理由同 MaxAllowHeight）*/
+	/**
+	 * 运行期改「自动非平面连接」的开关与参数：会立刻全量重烘一次导航（连接是烘在 NavData 里的，
+	 * 不重烘不生效）。bEnable 为 true 时 ProxyClass 不能为空。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation", meta = (Keywords = "nav link 连接 台阶"))
+	void ConfigureAutoNavLinks(bool bEnable, TSubclassOf<UVoxelNavLinkProxy> ProxyClass, int32 MaxHeightDiff);
+
+	bool ShouldAutoSpawnNavLinks() const { return bAutoSpawNavLink && DefaultLinkProxy != nullptr; }
+	int32 GetNavLinkMaxHeightDiff() const { return FMath::Clamp(NavLinkMaxHeightDiff, 1, Voxel::LENGTH - 1); }
+	TSubclassOf<UVoxelNavLinkProxy> GetAutoNavLinkProxyClass() const { return DefaultLinkProxy; }
+	const TArray<FVoxelNavLinkProxyData>& GetLinkProxyData() const { return LinkData; }
+
+	/* ===================== AI 占地（AI 与 AI 的互相避让） ===================== */
+
+	bool TryOccupyCoord(FIntVector Coord);
+	void ReleaseCoord(const FIntVector& Coord);
+	bool IsCoordOccupied(const FIntVector& Coord) const;
+	UVoxelNavLinkProxy* TryOccupyLink(FVoxelNavLinkProxyData Link);
+	void ReleaseLink(const FVoxelNavLinkProxyData& Link);
+	bool IsLinkOccupied(const FVoxelNavLinkProxyData& Link) const;
+
+	TArray<TPair<FIntVector, float>> FindFreeNearbyCoord(FIntVector Target, int32 AgentHeight, int32 Radius) const;
 
 	/** 按全局体素坐标取导航节点；返回 nullptr 表示该格不是落脚格（不是地面、被挡住、没烘到或没有 Chunk）*/
 	const FVoxelNavCell* FindNavCell(const FIntVector& GlobalCoord) const;
 
-	/** 把坐标吸附到导航图上：在它周围的立方半径内扫一圈，返回净空够 AgentHeight 的落脚格里最近的那个（半径上限 16）*/
-	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation", meta = (Keywords = "snap nearest 吸附 最近"))
-	bool FindNearbyNavCoord(FIntVector Coord, int32 AgentHeight, int32 Radius, FIntVector& OutCoord) const;
-
 	/**
-	 * A* 寻路：沿烘焙好的 NavData 从起点走到终点，只走水平 4 邻（正交网格，无斜向），
-	 * 每步只会是烘焙时判定过走得通的那条 Link，因此不会穿墙也不会悬空。
-	 * @param StartCoord/EndCoord	全局体素坐标。两端自己必须就是落脚格且净空够，否则直接返回 false —— 先拿 FindNearbyNavCoord 吸附
-	 * @param AgentHeight			AI 身高（体素格数，至少 1）：路径上每格的 AllowHeight 都必须 >= 它。
-	 * 								净空是封顶统计的，传的值大于 GetMaxAllowHeight() 时全图没有格能满足，必定找不到路
-	 * @param OutPath				成功时按行走顺序返回，含起点与终点；失败时为空
-	 * 步价 = Max(1, 终点格权重)，权重为 0 的格当软墙跳过；启发式是正交步数的下界，可采纳，故结果是最短路径
+	 * 限制：只适用于「占地 1 格」的 AI。AgentHeight 管的是落脚点自己那一列的竖直净空，横向完全没判，
 	 */
-	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation", meta = (Keywords = "a star astar path 寻路 路径 找路"))
-	bool FindPath(FIntVector StartCoord, FIntVector EndCoord, int32 AgentHeight, TArray<FIntVector>& OutPath) const;
-
-	/** FindPath 的世界坐标版：两端各自换算成体素坐标后寻路，输出路径上每格中心的世界坐标 */
-	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation", meta = (Keywords = "a star astar path 寻路 路径 找路"))
-	bool FindPathWorld(FVector StartLocation, FVector EndLocation, int32 AgentHeight, TArray<FVector>& OutPath) const;
+	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation", meta = (Keywords = "astar path 寻路 路径 找路"))
+	TArray<FVoxelPathPoint> FindPath(FIntVector StartCoord, FIntVector EndCoord, int32 AgentHeight) const;
 
 	/*====================== 地形射线检测 ============================*/
 
@@ -189,8 +210,14 @@ protected:
 	TSoftClassPtr<UVoxelGenerator> VoxelGenerator;
 	UPROPERTY(EditAnywhere, Category = "Voxel|Generator")
 	bool bRunGeneratorOnBeginPlay = false;
-	UPROPERTY(EditAnywhere, Category = "Voxel|Navigation", meta = (ClampMin = "1", ClampMax = "16", ToolTip = "净空（AllowHeight）统计的格数上限：落脚格向上数这么多格还没被挡就按“至少这么高”封顶。必须 >= 最重的 AI 体型，且不能超过一层的 16 格（否则局部重建要往下牵连的层数就不止一层）。"))
+	UPROPERTY(EditAnywhere, Category = "Voxel|Navigation", meta = (ClampMin = "1", ClampMax = "15", ToolTip = "净空（AllowHeight）统计的格数上限：落脚格向上数这么多格还没被挡就按“至少这么高”封顶。必须 >= 最重的 AI 体型，且不能超过一层的 16 格（否则局部重建要往下牵连的层数就不止一层）。只统计竖直方向，不判 AI 的横向占地：导航图始终按“一格宽”的体型烘焙。"))
 	int32 MaxAllowHeight = 4;
+	UPROPERTY(EditAnywhere, Category = "Voxel|Navigation")
+	bool bAutoSpawNavLink = false;
+	UPROPERTY(EditAnywhere, Category = "Voxel|Navigation", meta = (ClampMin = "1", ClampMax = "15", EditCondition = "bAutoSpawNavLink", ToolTip = "自动生成连接时允许的最大高度差（格数）。超过这个高差的两处落脚点，只能靠手动的 AddLinkProxy 连起来。夹在 1~16：不超过一层，否则局部重烘要牵连的层数就不止一层。"))
+	int32 NavLinkMaxHeightDiff = 1;
+	UPROPERTY(EditAnywhere, Category = "Voxel|Navigation", meta = (EditCondition = "bAutoSpawNavLink"))
+	TSubclassOf<UVoxelNavLinkProxy> DefaultLinkProxy;
 
 	UPROPERTY(VisibleAnywhere, Category = "Voxel")
 	TObjectPtr<USceneComponent> VoxelRoot;
@@ -221,9 +248,14 @@ protected:
 
 private:
 
-	/*将世界坐标转换为Section坐标和Section内本地坐标*/
-	static TPair<FIntVector, FIntVector> WorldCoordToChunkLocalCoord(const FIntVector& WorldCoord);
 	FVoxelChunk& FindOrAddChunk(FIntVector2 ChunkCoord);
+
+	/** 改一体素时，导航在 Z 方向能牵连到多远的格子：净空向上要看 MaxAllowHeight 格，
+ *  自动连接又可能把连接拉到 NavLinkMaxHeightDiff 格高 —— 取二者较大，脏区判定用它 */
+	int32 GetMaxImpactHeight() const;
+
+	/*手动加/删连接后，把两端所在的 Section 立刻重烘一遍（连接是烘在 NavData 里的）*/
+	void RebuildLinksAround(const FVoxelNavLinkProxyData& ProxyData);
 
 	UPROPERTY()
 	TMap<FIntVector2, FVoxelChunk> Chunks;
@@ -234,4 +266,11 @@ private:
 
 	UPROPERTY()
 	TMap<FIntVector, float> NavWeights;
+
+	UPROPERTY()
+	TArray<FVoxelNavLinkProxyData> LinkData;
+
+	TSet<FIntVector> CoordRecords;
+	UPROPERTY(Transient)
+	TMap<FVoxelNavLinkProxyData, UVoxelNavLinkProxy*> LinkProxyRecords;
 };
