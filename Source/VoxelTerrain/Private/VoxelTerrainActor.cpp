@@ -110,6 +110,9 @@ FIntVector AVoxelTerrainActor::GetSectionCoordFromWorldCoord(const FIntVector& W
 
 void AVoxelTerrainActor::MarkSectionDirty(FIntVector SectionCoord, FIntVector LocalCoord)
 {
+	if (!GetWorld()) return;
+	if (!GetWorld()->IsGameWorld()) return;	// 编辑器里不跑 Tick，脏区标记没意义
+
 	// 本 Section 必然要重建；改动落在边界上时，相邻 Section 的遮挡判断结果也会变，同样要重建
 	FIntVector SectionCoords[7] = { SectionCoord };
 	int32 Num = 1;
@@ -181,11 +184,8 @@ void AVoxelTerrainActor::ClearTerrain()
 	Chunks.Reset();
 	NavWeights.Reset();
 	LinkData.Reset();
-	LinkProxyRecords.Reset();
 	CoordRecords.Reset();
 #if WITH_EDITOR
-	// 数据都清了就不该再留"要补建网格"的标记：否则编辑器里下一次 PostRegisterAllComponents
-	// 会挂着 AssetManager 回调对着空 Chunks 跑一遍全量重建
 	bNeedsMeshBuild = false;
 #endif
 }
@@ -521,4 +521,9 @@ FVoxelChunk& AVoxelTerrainActor::FindOrAddChunk(FIntVector2 ChunkCoord)
 	}
 
 	return Chunks.Emplace(ChunkCoord, FVoxelChunk{ ChunkCoord, MinHeight, MaxHeight });
+}
+
+int32 AVoxelTerrainActor::GetMaxImpactHeight() const
+{
+	return FMath::Max(GetMaxAllowHeight(), ShouldAutoSpawnNavLinks() ? GetNavLinkMaxHeightDiff() : 0);
 }

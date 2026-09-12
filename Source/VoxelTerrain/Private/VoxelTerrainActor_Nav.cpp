@@ -219,38 +219,35 @@ void AVoxelTerrainActor::ConfigureAutoNavLinks(bool bEnable, TSubclassOf<UVoxelN
 	}
 
 	bAutoSpawNavLink = bEnable;
-	DefaultLinkProxy = ProxyClass;
+	AutoLinkProxy = ProxyClass;
 	NavLinkMaxHeightDiff = MaxHeightDiff;
 
 	// 连接是烘在 NavData 里的，开关一改必须重烘才生效
 	BuildNavData();
 }
 
-void AVoxelTerrainActor::AddLinkProxy(const FVoxelNavLinkProxyData& ProxyData)
+void AVoxelTerrainActor::AddLinkProxy(const FVoxelNavLinkProxyData& ProxyData, bool bRebuildNavData)
 {
 	LinkData.Add(ProxyData);
-
-	if (GetWorld() && GetWorld()->IsGameWorld())
+	if (bRebuildNavData)
 	{
 		RebuildLinksAround(ProxyData);
 	}
 }
 
-void AVoxelTerrainActor::RemoveLinkProxy(const FVoxelNavLinkProxyData& ProxyData)
+void AVoxelTerrainActor::RemoveLinkProxy(const FVoxelNavLinkProxyData& ProxyData, bool bRebuildNavData)
 {
-	if (LinkProxyRecords.Remove(ProxyData) > 0 && GetWorld() && GetWorld()->IsGameWorld())
+	if (LinkData.Remove(ProxyData) > 0 && bRebuildNavData)
 	{
 		RebuildLinksAround(ProxyData);
 	}
-}
-
-int32 AVoxelTerrainActor::GetMaxImpactHeight() const
-{
-	return FMath::Max(GetMaxAllowHeight(), ShouldAutoSpawnNavLinks() ? GetNavLinkMaxHeightDiff() : 0);
 }
 
 void AVoxelTerrainActor::RebuildLinksAround(const FVoxelNavLinkProxyData& ProxyData)
 {
+	if (!GetWorld()) return;
+	if (!GetWorld()->IsGameWorld()) return;	// 编辑器里不烘导航，烘了也没用
+
 	// 连接是烘在 NavData 里的，所以手动加/删之后要立刻把两端所在的那两格 Section 重烘一次，
 	// 否则得等到有人改体素把它标脏才生效。这里只重烘导航，不动网格（网格跟连接无关）
 	for (const FIntVector& EndPoint : { ProxyData.StartCoord, ProxyData.Destination })
@@ -268,48 +265,47 @@ void AVoxelTerrainActor::RebuildLinksAround(const FVoxelNavLinkProxyData& ProxyD
    移动器在跨进下一格之前先把它登记下来（预约制），所以既不会出现两个 AI 挤同一格，
    也不会出现两个 AI 对穿（双方都想进对方那格时，慢的一方根本占不到，只能在原地等）。 */
 
-bool AVoxelTerrainActor::TryOccupyCoord(FIntVector Coord)
+bool AVoxelTerrainActor::TryOccupyCoord(FIntVector Coord, AActor* Occupant)
 {
-	if (IsCoordOccupied(Coord))
+	if (GetCoordOccupant(Coord))
 	{
 		return false;
 	}
 	else
 	{
-		CoordRecords.Add(MoveTemp(Coord));
+		CoordRecords.Emplace(MoveTemp(Coord), Occupant);
 		return true;
 	}
 }
 
-void AVoxelTerrainActor::ReleaseCoord(const FIntVector& Coord)
+void AVoxelTerrainActor::ReleaseCoord(const FIntVector& Coord, AActor* Occupant)
 {
-	CoordRecords.Remove(Coord);
-}
-
-bool AVoxelTerrainActor::IsCoordOccupied(const FIntVector& Coord) const
-{
-	return CoordRecords.Contains(Coord);
-}
-
-UVoxelNavLinkProxy* AVoxelTerrainActor::TryOccupyLink(FVoxelNavLinkProxyData Link)
-{
-	if (IsLinkOccupied(Link))
+	if (GetCoordOccupant(Coord) == Occupant)
 	{
-		return nullptr;
+		CoordRecords.Remove(Coord);
 	}
-
-	UVoxelNavLinkProxy* LinkProxyObject = NewObject<UVoxelNavLinkProxy>(this, Link.ProxyClass);
-	return LinkProxyRecords.Add(MoveTemp(Link), LinkProxyObject);
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[Voxel] %s 试图释放 (%d,%d,%d) 占地，但它并不是占用者，已忽略"),
+			*Occupant->GetName(), Coord.X, Coord.Y, Coord.Z);
+	}
 }
 
-void AVoxelTerrainActor::ReleaseLink(const FVoxelNavLinkProxyData& Link)
+AActor* AVoxelTerrainActor::GetCoordOccupant(const FIntVector& Coord) const
 {
-	LinkProxyRecords.Remove(Link);
-}
-
-bool AVoxelTerrainActor::IsLinkOccupied(const FVoxelNavLinkProxyData& Link) const
-{
-	return LinkProxyRecords.Contains(Link);
+	if (auto* WeakActor = CoordRecords.Find(Coord))
+	{
+		if (AActor* Actor = WeakActor->Get())
+		{
+			return Actor;
+		}
+		else
+		{
+			CoordRecords.Remove(Coord);
+			return nullptr;
+		}
+	}
+	return nullptr;
 }
 
 const FVoxelNavCell* AVoxelTerrainActor::FindNavCell(const FIntVector& GlobalCoord) const
@@ -334,7 +330,7 @@ TArray<TPair<FIntVector, float>> AVoxelTerrainActor::FindFreeNearbyCoord(FIntVec
 			{
 				const FIntVector Candidate{ Target.X + dx, Target.Y + dy, Target.Z + dz };
 				const FVoxelNavCell* Cell = FindNavCell(Candidate);
-				if (Cell && Cell->AllowHeight >= AgentHeight && !IsCoordOccupied(Candidate))
+				if (Cell && Cell->AllowHeight >= AgentHeight && !GetCoordOccupant(Candidate))
 				{
 					Result.Emplace(Candidate, GetCoordNavWeight(Candidate));
 				}
@@ -433,7 +429,7 @@ TArray<FVoxelPathPoint> AVoxelTerrainActor::FindPath(FIntVector StartCoord, FInt
 				continue; // 对方站不下这个体型的 AI
 			}
 
-			if (IsCoordOccupied(NextCoord))
+			if (GetCoordOccupant(NextCoord))
 			{
 				// 站着别的 AI。占地是随时间变的，所以只在查询期判，绝不写进烘焙数据；
 				// 终点也走这条判定，所以「终点被人占了」会直接表现为找不到路，由调用方退到 4 邻

@@ -248,7 +248,7 @@ public:
 	 * 「本次广播本身就来自被新请求顶掉的那次中止」时重入会被拒绝并告警。
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
-	bool RequestMove(const TArray<FVoxelPathPoint>& InPath);
+	bool RequestMove(TArray<FVoxelPathPoint> InPath);
 
 	/** 中止当前移动（正在等的连接会被释放），结果码 Aborted */
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
@@ -291,10 +291,6 @@ public:
 	/** 当前所处的格（按 Actor 位置反推）。没有地形 / 没有 Owner 时返回 (MAX_int32, MAX_int32, MAX_int32) */
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
 	FIntVector GetCurrentCoord() const;
-
-	/** 最近一次传入路径的终点（路径的最后一个点） */
-	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
-	FIntVector GetDestinationCoord() const { return ActiveGoal; }
 
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
 	FVoxelPathFollowingResultInfo GetLastResult() const { return LastResult; }
@@ -416,12 +412,7 @@ private:
 	FIntVector InvalidCoord() const { return FIntVector(MAX_int32, MAX_int32, MAX_int32); }
 
 	/* ---- 运行期状态 ---- */
-
-	UPROPERTY(Transient)
-	TObjectPtr<UActorComponent> MovementComponent;			// 实现 INavMovementInterface 的那个组件
-
-	/** 最近一次传入路径的终点（路径的最后一个点）：用于 GetDestinationCoord 与占位预约 */
-	FIntVector ActiveGoal = FIntVector::ZeroValue;
+	TWeakInterfacePtr<INavMovementInterface> MovementInterface;
 
 	TArray<FVoxelPathPoint> Path;
 	int32 PathIndex = 0;
@@ -433,10 +424,8 @@ private:
 	bool bHasClaim = false;
 	/** 出发时预约下来的终点格 */
 	FIntVector ReservedGoal = FIntVector::ZeroValue;
-	bool bHasGoalReservation = false;
 
-	/** 正在使用的连接（用于 ReleaseLink） */
-	FVoxelNavLinkProxyData ActiveLink;
+	/** 正在使用的连接 */
 	UPROPERTY(Transient)
 	TObjectPtr<UVoxelNavLinkProxy> ActiveLinkProxy;
 	bool bLinkResumed = false;

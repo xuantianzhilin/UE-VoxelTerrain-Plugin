@@ -60,15 +60,10 @@ void UVoxelPathFollowingComponent::EndPlay(const EEndPlayReason::Type EndPlayRea
 	{
 		if (bHasClaim)
 		{
-			Terrain->ReleaseCoord(ClaimedCoord);
-		}
-		if (bHasGoalReservation)
-		{
-			Terrain->ReleaseCoord(ReservedGoal);
+			Terrain->ReleaseCoord(ClaimedCoord, GetOwner());
 		}
 	}
 	bHasClaim = false;
-	bHasGoalReservation = false;
 	Status = EVoxelPathFollowingStatus::Idle;
 	Path.Reset();
 
@@ -116,17 +111,17 @@ AVoxelTerrainActor* UVoxelPathFollowingComponent::GetTerrain() const
 
 INavMovementInterface* UVoxelPathFollowingComponent::GetNavMovement() const
 {
-	return Cast<INavMovementInterface>(MovementComponent.Get());
+	return MovementInterface.Get();
 }
 
 EVoxelMoveDrive UVoxelPathFollowingComponent::GetActiveDrive() const
 {
-	return MovementComponent ? EVoxelMoveDrive::NavMovement : EVoxelMoveDrive::DirectLocation;
+	return MovementInterface.IsValid() ? EVoxelMoveDrive::NavMovement : EVoxelMoveDrive::DirectLocation;
 }
 
 void UVoxelPathFollowingComponent::ResolveDrive()
 {
-	MovementComponent = nullptr;
+	MovementInterface = nullptr;
 
 	if (Drive == EVoxelMoveDrive::DirectLocation)
 	{
@@ -136,10 +131,10 @@ void UVoxelPathFollowingComponent::ResolveDrive()
 	if (const AActor* Owner = GetOwner())
 	{
 		// 非模板重载 + Cast：比 FindComponentByInterface<T>() 的模板推导更直白，也和引擎 AIController 的用法一致
-		MovementComponent = Owner->FindComponentByInterface(UNavMovementInterface::StaticClass());
+		MovementInterface = Owner->FindComponentByInterface(UNavMovementInterface::StaticClass());
 	}
 
-	if (!MovementComponent && Drive == EVoxelMoveDrive::NavMovement)
+	if (!MovementInterface.IsValid() && Drive == EVoxelMoveDrive::NavMovement)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[Voxel] %s 上没有实现 INavMovementInterface 的移动组件，本次移动退回直接插值"),
 			*GetNameSafe(GetOwner()));
@@ -350,7 +345,7 @@ void UVoxelPathFollowingComponent::StopNavMovement()
 
 /* ===================== 请求 ===================== */
 
-bool UVoxelPathFollowingComponent::RequestMove(const TArray<FVoxelPathPoint>& InPath)
+bool UVoxelPathFollowingComponent::RequestMove(TArray<FVoxelPathPoint> InPath)
 {
 	if (bSwitchingRequest)
 	{
@@ -370,16 +365,15 @@ bool UVoxelPathFollowingComponent::RequestMove(const TArray<FVoxelPathPoint>& In
 		bSwitchingRequest = false;
 	}
 
-	Path = InPath;
+	Path = MoveTemp(InPath);
 	// 起点格就是「我现在站的格」（下面会校验），所以不需要先挪到它的格心上去：
 	// 多点的路径直接从第 2 个点开始走，免得开局就卡在「差两厘米到不了自己脚下格心」上。
 	// 只有一个点的路径是「对齐到这一格的格心」，那才需要走到位
 	PathIndex = (Path.Num() > 1) ? 1 : 0;
 	StallTimer = 0.f;
 	StallBestDist = TNumericLimits<float>::Max();
-	ActiveGoal = Path.IsEmpty() ? FIntVector::ZeroValue : Path.Last().Coord;
 	LastResult = FVoxelPathFollowingResultInfo{};
-	LastResult.GoalCoord = ActiveGoal;
+	LastResult.GoalCoord = Path.IsEmpty() ? FIntVector::ZeroValue : Path.Last().Coord;
 
 	if (!Owner || !FoundTerrain)
 	{
@@ -462,25 +456,12 @@ bool UVoxelPathFollowingComponent::RequestMove(const TArray<FVoxelPathPoint>& In
 	if (bClaimCells)
 	{
 		SyncClaimToCurrentCoord();
-		if (ActiveGoal != ClaimedCoord)
-		{
-			if (FoundTerrain->TryOccupyCoord(ActiveGoal))
-			{
-				ReservedGoal = ActiveGoal;
-				bHasGoalReservation = true;
-			}
-			else
-			{
-				UE_LOG(LogTemp, Warning, TEXT("[Voxel] 预约终点 (%d,%d,%d) 失败（已被别人占），仍按传入的路径前进"),
-					ActiveGoal.X, ActiveGoal.Y, ActiveGoal.Z);
-			}
-		}
 	}
 
 	if (bLogNavigation)
 	{
 		UE_LOG(LogTemp, Log, TEXT("[Voxel] %s RequestMove：起点格 %s 终点格 %s 点数 %d 从第 %d 个点开始 驱动 %s 速度 %.0f 站位偏移 %s Actor %s Terrain %s"),
-			*GetNameSafe(Owner), *Path[0].Coord.ToString(), *ActiveGoal.ToString(), Path.Num(), PathIndex + 1,
+			*GetNameSafe(Owner), *Path[0].Coord.ToString(), *LastResult.GoalCoord.ToString(), Path.Num(), PathIndex + 1,
 			GetActiveDrive() == EVoxelMoveDrive::NavMovement ? TEXT("移动组件") : TEXT("直接插值"),
 			MoveSpeed, *GetCellOffset().ToCompactString(), *Owner->GetActorLocation().ToCompactString(),
 			*GetNameSafe(FoundTerrain));
@@ -770,11 +751,11 @@ void UVoxelPathFollowingComponent::SyncClaimToCurrentCoord()
 		return;
 	}
 
-	if (Terrain->TryOccupyCoord(Current))
+	if (Terrain->TryOccupyCoord(Current, GetOwner()))
 	{
 		if (bHasClaim)
 		{
-			Terrain->ReleaseCoord(ClaimedCoord);
+			Terrain->ReleaseCoord(ClaimedCoord, GetOwner());
 		}
 		ClaimedCoord = Current;
 		bHasClaim = true;
@@ -798,18 +779,10 @@ void UVoxelPathFollowingComponent::StartLinkHop()
 	}
 
 	const FVoxelPathPoint& NextPoint = Path[PathIndex];
-
-	// 键与烘焙时的 ByStart/ByDestination 完全一致：{起点格, 终点格, 代理类}
-	ActiveLink.StartCoord = Path[PathIndex - 1].Coord;
-	ActiveLink.Destination = NextPoint.Coord;
-	ActiveLink.ProxyClass = NextPoint.LinkClass;
-
-	ActiveLinkProxy = Terrain->TryOccupyLink(ActiveLink);
+	ActiveLinkProxy = NewObject<UVoxelNavLinkProxy>(this, NextPoint.LinkClass);
 	if (!ActiveLinkProxy)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[Voxel] 连接 (%d,%d,%d)->(%d,%d,%d) 已被别的 Agent 占着，移动中止"),
-			ActiveLink.StartCoord.X, ActiveLink.StartCoord.Y, ActiveLink.StartCoord.Z,
-			ActiveLink.Destination.X, ActiveLink.Destination.Y, ActiveLink.Destination.Z);
+		UE_LOG(LogTemp, Warning, TEXT("[Voxel] 连接创建失败，移动中止"));
 		FinishMove(EVoxelPathFollowingResult::Blocked);
 		return;
 	}
@@ -873,10 +846,6 @@ void UVoxelPathFollowingComponent::ResumeFromLink()
 
 void UVoxelPathFollowingComponent::ReleaseActiveLink()
 {
-	if (ActiveLinkProxy && IsValid(Terrain))
-	{
-		Terrain->ReleaseLink(ActiveLink);
-	}
 	ActiveLinkProxy = nullptr;
 	bLinkResumed = false;
 }
@@ -894,13 +863,6 @@ void UVoxelPathFollowingComponent::FinishMove(EVoxelPathFollowingResult Code)
 		if (bClaimCells && IsValid(Terrain))
 		{
 			SyncClaimToCurrentCoord();		// 收尾时把脚下这格登记准（起点格的手续也在这里还回去）
-
-			// 没走到预约的终点就把预约还掉；走到了就留着 —— 那已经是「自己占的那一格」
-			if (bHasGoalReservation && GetCurrentCoord() != ReservedGoal)
-			{
-				Terrain->ReleaseCoord(ReservedGoal);
-			}
-			bHasGoalReservation = false;
 		}
 
 		if (bStopMovementOnFinish)

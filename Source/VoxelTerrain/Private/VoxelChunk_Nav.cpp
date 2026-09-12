@@ -267,7 +267,7 @@ void FVoxelSection::BuildNavData(const AVoxelTerrainActor* Terrain)
 	   - 平面连接：同一层、水平相邻。UVoxelPathFollowingComponent 自己插值走过去。
 	   - 非平面连接：高度不同或不相邻。这类必须挂一个 UVoxelNavLinkProxy，由它把人挪到对面去。
 	   自动连接（bAutoSpawNavLink）负责把「高差在 NavLinkMaxHeightDiff 内的相邻格」用
-	   DefaultLinkProxy 连起来；手动连接走 AddLinkProxy，两端距离不限。 */
+	   AutoLinkProxy 连起来；手动连接走 AddLinkProxy，两端距离不限。 */
 	const int32 MaxAllowHeight = Terrain->GetMaxAllowHeight();
 	const bool bAutoLinks = Terrain->ShouldAutoSpawnNavLinks();
 	const int32 LinkReachZ = bAutoLinks ? Terrain->GetNavLinkMaxHeightDiff() : 0;

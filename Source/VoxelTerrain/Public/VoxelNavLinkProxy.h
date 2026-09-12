@@ -25,11 +25,6 @@ struct FVoxelNavLinkProxyData
 	}
 };
 
-FORCEINLINE uint32 GetTypeHash(const FVoxelNavLinkProxyData& Key)
-{
-	return HashCombine(HashCombine(GetTypeHash(Key.StartCoord), GetTypeHash(Key.Destination)), GetTypeHash(Key.ProxyClass));
-}
-
 /**
  * 一条「非平面导航连接」的驱动者。
  *

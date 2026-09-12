@@ -13,7 +13,6 @@ class UProceduralMeshComponent;
 namespace Voxel
 {
 	// 向 -inf 取整的整数除法：C++ 的 "/" 向 0 截断，负坐标会把 Section 索引/本地坐标算错
-	// inline 不能省：这是公开头文件里的函数体，多个 .cpp 包含它会在链接时报 LNK2005 重复定义
 	inline int32 FloorDivide(int32 Dividend, int32 Divisor)
 	{
 		check(Divisor > 0);
@@ -154,9 +153,9 @@ public:
 
 
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
-	void AddLinkProxy(const FVoxelNavLinkProxyData& ProxyData);
+	void AddLinkProxy(const FVoxelNavLinkProxyData& ProxyData, bool bRebuildNavData = true);
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
-	void RemoveLinkProxy(const FVoxelNavLinkProxyData& ProxyData);
+	void RemoveLinkProxy(const FVoxelNavLinkProxyData& ProxyData, bool bRebuildNavData = true);
 
 	/** 自动连接的开关与参数（烘焙要用；NavLinkMaxHeightDiff 夹在 [1, Voxel::LENGTH]，理由同 MaxAllowHeight）*/
 	/**
@@ -166,19 +165,14 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation", meta = (Keywords = "nav link 连接 台阶"))
 	void ConfigureAutoNavLinks(bool bEnable, TSubclassOf<UVoxelNavLinkProxy> ProxyClass, int32 MaxHeightDiff);
 
-	bool ShouldAutoSpawnNavLinks() const { return bAutoSpawNavLink && DefaultLinkProxy != nullptr; }
+	bool ShouldAutoSpawnNavLinks() const { return bAutoSpawNavLink && AutoLinkProxy != nullptr; }
 	int32 GetNavLinkMaxHeightDiff() const { return FMath::Clamp(NavLinkMaxHeightDiff, 1, Voxel::LENGTH - 1); }
-	TSubclassOf<UVoxelNavLinkProxy> GetAutoNavLinkProxyClass() const { return DefaultLinkProxy; }
+	TSubclassOf<UVoxelNavLinkProxy> GetAutoNavLinkProxyClass() const { return AutoLinkProxy; }
 	const TArray<FVoxelNavLinkProxyData>& GetLinkProxyData() const { return LinkData; }
 
-	/* ===================== AI 占地（AI 与 AI 的互相避让） ===================== */
-
-	bool TryOccupyCoord(FIntVector Coord);
-	void ReleaseCoord(const FIntVector& Coord);
-	bool IsCoordOccupied(const FIntVector& Coord) const;
-	UVoxelNavLinkProxy* TryOccupyLink(FVoxelNavLinkProxyData Link);
-	void ReleaseLink(const FVoxelNavLinkProxyData& Link);
-	bool IsLinkOccupied(const FVoxelNavLinkProxyData& Link) const;
+	bool TryOccupyCoord(FIntVector Coord, AActor* Occupant);
+	void ReleaseCoord(const FIntVector& Coord, AActor* Occupant);
+	AActor* GetCoordOccupant(const FIntVector& Coord) const;
 
 	TArray<TPair<FIntVector, float>> FindFreeNearbyCoord(FIntVector Target, int32 AgentHeight, int32 Radius) const;
 
@@ -190,6 +184,11 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation", meta = (Keywords = "astar path 寻路 路径 找路"))
 	TArray<FVoxelPathPoint> FindPath(FIntVector StartCoord, FIntVector EndCoord, int32 AgentHeight) const;
+
+private:
+
+	/*手动加/删连接后，把两端所在的 Section 立刻重烘一遍（连接是烘在 NavData 里的）*/
+	void RebuildLinksAround(const FVoxelNavLinkProxyData& ProxyData);
 
 	/*====================== 地形射线检测 ============================*/
 
@@ -217,7 +216,7 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "Voxel|Navigation", meta = (ClampMin = "1", ClampMax = "15", EditCondition = "bAutoSpawNavLink", ToolTip = "自动生成连接时允许的最大高度差（格数）。超过这个高差的两处落脚点，只能靠手动的 AddLinkProxy 连起来。夹在 1~16：不超过一层，否则局部重烘要牵连的层数就不止一层。"))
 	int32 NavLinkMaxHeightDiff = 1;
 	UPROPERTY(EditAnywhere, Category = "Voxel|Navigation", meta = (EditCondition = "bAutoSpawNavLink"))
-	TSubclassOf<UVoxelNavLinkProxy> DefaultLinkProxy;
+	TSubclassOf<UVoxelNavLinkProxy> AutoLinkProxy;
 
 	UPROPERTY(VisibleAnywhere, Category = "Voxel")
 	TObjectPtr<USceneComponent> VoxelRoot;
@@ -254,9 +253,6 @@ private:
  *  自动连接又可能把连接拉到 NavLinkMaxHeightDiff 格高 —— 取二者较大，脏区判定用它 */
 	int32 GetMaxImpactHeight() const;
 
-	/*手动加/删连接后，把两端所在的 Section 立刻重烘一遍（连接是烘在 NavData 里的）*/
-	void RebuildLinksAround(const FVoxelNavLinkProxyData& ProxyData);
-
 	UPROPERTY()
 	TMap<FIntVector2, FVoxelChunk> Chunks;
 	TMap<FIntVector2, TArray<FIntVector>> DirtySections;
@@ -266,11 +262,8 @@ private:
 
 	UPROPERTY()
 	TMap<FIntVector, float> NavWeights;
-
 	UPROPERTY()
 	TArray<FVoxelNavLinkProxyData> LinkData;
 
-	TSet<FIntVector> CoordRecords;
-	UPROPERTY(Transient)
-	TMap<FVoxelNavLinkProxyData, UVoxelNavLinkProxy*> LinkProxyRecords;
+	mutable TMap<FIntVector, TWeakObjectPtr<AActor>> CoordRecords;
 };
