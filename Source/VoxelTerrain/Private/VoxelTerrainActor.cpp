@@ -3,6 +3,7 @@
 #include "VoxelGenerator.h"
 #include "Components/SceneComponent.h"
 #include "Engine/AssetManager.h"
+#include "Engine/World.h"
 
 AVoxelTerrainActor::AVoxelTerrainActor()
 {

@@ -5,6 +5,7 @@
 #include "VoxelPathFollowingComponent.h"
 #include "Algo/Reverse.h"
 #include "VoxelChunk.h"
+#include "Engine/World.h"
 
 namespace
 {

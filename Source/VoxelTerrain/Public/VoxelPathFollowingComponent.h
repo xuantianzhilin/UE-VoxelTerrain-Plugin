@@ -2,12 +2,13 @@
 
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
+#include "GameFramework/NavMovementInterface.h"
+#include "UObject/WeakInterfacePtr.h"
 #include "VoxelNavLinkProxy.h"
 #include "VoxelPathFollowingComponent.generated.h"
 
 class UVoxelNavLinkProxy;
 class AVoxelTerrainActor;
-class INavMovementInterface;
 
 USTRUCT(BlueprintType)
 struct FVoxelPathPoint
