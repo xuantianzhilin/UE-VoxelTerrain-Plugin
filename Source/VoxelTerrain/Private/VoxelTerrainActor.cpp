@@ -372,8 +372,33 @@ bool AVoxelTerrainActor::LineSingleTraceVoxel(const FVector& Start, const FVecto
 {
 	if ((End - Start).IsNearlyZero()) return false;
 
-	const FVector P0 = GetActorTransform().InverseTransformPosition(Start) / VoxelSize;
-	const FVector V = GetActorTransform().InverseTransformVector(End) / VoxelSize - P0;
+	FVector P0 = GetActorTransform().InverseTransformPosition(Start) / VoxelSize;
+	FVector V = GetActorTransform().InverseTransformVector(End) / VoxelSize - P0;
+
+	/* 起点落在有效高度 [MinHeight, MaxHeight) 之外时（例如高空俯视的相机），DDA 走一步就会因出界 break，
+	   永远打不到地面 —— 这里先把线段沿 Z 裁进有效高度，从交点处起测；起点本就在范围内时不改动任何输入。
+	   P 参数化不变：局部坐标 = P0 + V * t，t∈[0,1] 对应（裁剪后的）线段全程 */
+	if (P0.Z < static_cast<double>(MinHeight) || P0.Z >= static_cast<double>(MaxHeight))
+	{
+		if (FMath::IsNearlyZero(V.Z))
+		{
+			return false; // 平行于高度层且不在范围内：不会进入体素数据
+		}
+		const double MinZ = static_cast<double>(MinHeight);
+		const double MaxZ = static_cast<double>(MaxHeight);
+		const double TBelow = (MinZ - P0.Z) / V.Z; // 与层底面的交点参数
+		const double TAbove = (MaxZ - P0.Z) / V.Z; // 与层顶面的交点参数
+		const double TNear = FMath::Clamp(FMath::Min(TBelow, TAbove), 0.0, 1.0);
+		const double TFar = FMath::Clamp(FMath::Max(TBelow, TAbove), 0.0, 1.0);
+		if (TNear >= TFar)
+		{
+			return false; // 线段与有效高度范围无交集（射线在远离范围，或入口已在终点之外）
+		}
+		P0 += V * TNear;
+		V *= TFar - TNear;
+		// 交点精确落在层边界上时 floor 会取到范围外的格子，往范围内侧推一个可忽略的微小量
+		P0.Z = V.Z < 0.0 ? MaxZ - 1e-4 : MinZ + 1e-4;
+	}
 
 	double TMax[3];
 	double TDelta[3];

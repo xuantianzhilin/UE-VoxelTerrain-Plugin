@@ -194,6 +194,10 @@ private:
 
 public:
 
+	/**
+	* 对体素数据做 DDA 射线检测（世界坐标线段 Start→End，不依赖物理碰撞）。
+	* 起点在有效高度 [MinHeight, MaxHeight) 之外时，内部会先把线段沿 Z 裁进范围再从交点起测，
+	*/
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Query")
 	bool LineSingleTraceVoxel(const FVector& Start, const FVector& End, FVoxelTraceHit& OutHit);
 
