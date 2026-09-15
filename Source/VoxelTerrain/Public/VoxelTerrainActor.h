@@ -3,11 +3,9 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "VoxelChunk.h"
-#include "VoxelNavLinkProxy.h"
 #include "VoxelTerrainActor.generated.h"
 
 class UVoxelGenerator;
-struct FVoxelPathPoint;
 class UProceduralMeshComponent;
 
 namespace Voxel
@@ -127,69 +125,6 @@ private:
 	void BuildMeshesInEditor(bool bForced = false);
 #endif
 
-	/* ===================== 寻路（不依赖 NavMesh，走烘焙出来的导航数据） ===================== */
-
-public:
-
-	/** 净空统计的格数上限：落脚格向上数这么多格还没被挡，就按“至少这么高”封顶（见 FVoxelNavCell::AllowHeight）。
-	 *  刻意夹在 [1, Voxel::LENGTH]：净空是向上看的，不超过一层，改一体素时才只需连下方那一层一起重烘 */
-	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
-	int32 GetMaxAllowHeight() const { return FMath::Clamp(MaxAllowHeight, 1, Voxel::LENGTH - 1); }
-
-	/*全量烘焙所有 Section 的导航数据（BeginPlay 已经调过一次；运行期改体素走脏区局部重建）*/
-	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
-	void BuildNavData();
-
-	/* 区域通行权重：查询期数据，不参与烘焙（刷权重不需要重烘，烘焙也不读它）。
-	   1=正常，>1 更难走，0=软墙（能站但没人绕过来），负数/NaN 拒收；等于 1 的条目不落表 */
-	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
-	void SetCoordNavWeight(FIntVector Coord, float Weight);
-	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
-	void ClearCoordNavWeight(FIntVector Coord);
-	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
-	float GetCoordNavWeight(FIntVector Coord) const;
-	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
-	void SetCoordNavWeightBox(FIntVector Min, FIntVector Max, float Weight);
-
-
-	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
-	void AddLinkProxy(const FVoxelNavLinkProxyData& ProxyData, bool bRebuildNavData = true);
-	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
-	void RemoveLinkProxy(const FVoxelNavLinkProxyData& ProxyData, bool bRebuildNavData = true);
-
-	/** 自动连接的开关与参数（烘焙要用；NavLinkMaxHeightDiff 夹在 [1, Voxel::LENGTH]，理由同 MaxAllowHeight）*/
-	/**
-	 * 运行期改「自动非平面连接」的开关与参数：会立刻全量重烘一次导航（连接是烘在 NavData 里的，
-	 * 不重烘不生效）。bEnable 为 true 时 ProxyClass 不能为空。
-	 */
-	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation", meta = (Keywords = "nav link 连接 台阶"))
-	void ConfigureAutoNavLinks(bool bEnable, TSubclassOf<UVoxelNavLinkProxy> ProxyClass, int32 MaxHeightDiff);
-
-	bool ShouldAutoSpawnNavLinks() const { return bAutoSpawNavLink && AutoLinkProxy != nullptr; }
-	int32 GetNavLinkMaxHeightDiff() const { return FMath::Clamp(NavLinkMaxHeightDiff, 1, Voxel::LENGTH - 1); }
-	TSubclassOf<UVoxelNavLinkProxy> GetAutoNavLinkProxyClass() const { return AutoLinkProxy; }
-	const TArray<FVoxelNavLinkProxyData>& GetLinkProxyData() const { return LinkData; }
-
-	bool TryOccupyCoord(FIntVector Coord, AActor* Occupant);
-	void ReleaseCoord(const FIntVector& Coord, AActor* Occupant);
-	AActor* GetCoordOccupant(const FIntVector& Coord) const;
-
-	TArray<TPair<FIntVector, float>> FindFreeNearbyCoord(FIntVector Target, int32 AgentHeight, int32 Radius) const;
-
-	/** 按全局体素坐标取导航节点；返回 nullptr 表示该格不是落脚格（不是地面、被挡住、没烘到或没有 Chunk）*/
-	const FVoxelNavCell* FindNavCell(const FIntVector& GlobalCoord) const;
-
-	/**
-	 * 限制：只适用于「占地 1 格」的 AI。AgentHeight 管的是落脚点自己那一列的竖直净空，横向完全没判，
-	 */
-	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation", meta = (Keywords = "astar path 寻路 路径 找路"))
-	TArray<FVoxelPathPoint> FindPath(FIntVector StartCoord, FIntVector EndCoord, int32 AgentHeight) const;
-
-private:
-
-	/*手动加/删连接后，把两端所在的 Section 立刻重烘一遍（连接是烘在 NavData 里的）*/
-	void RebuildLinksAround(const FVoxelNavLinkProxyData& ProxyData);
-
 	/*====================== 地形射线检测 ============================*/
 
 public:
@@ -213,14 +148,6 @@ protected:
 	TSoftClassPtr<UVoxelGenerator> VoxelGenerator;
 	UPROPERTY(EditAnywhere, Category = "Voxel|Generator")
 	bool bRunGeneratorOnBeginPlay = false;
-	UPROPERTY(EditAnywhere, Category = "Voxel|Navigation", meta = (ClampMin = "1", ClampMax = "15", ToolTip = "净空（AllowHeight）统计的格数上限：落脚格向上数这么多格还没被挡就按“至少这么高”封顶。必须 >= 最重的 AI 体型，且不能超过一层的 16 格（否则局部重建要往下牵连的层数就不止一层）。只统计竖直方向，不判 AI 的横向占地：导航图始终按“一格宽”的体型烘焙。"))
-	int32 MaxAllowHeight = 4;
-	UPROPERTY(EditAnywhere, Category = "Voxel|Navigation")
-	bool bAutoSpawNavLink = false;
-	UPROPERTY(EditAnywhere, Category = "Voxel|Navigation", meta = (ClampMin = "1", ClampMax = "15", EditCondition = "bAutoSpawNavLink", ToolTip = "自动生成连接时允许的最大高度差（格数）。超过这个高差的两处落脚点，只能靠手动的 AddLinkProxy 连起来。夹在 1~16：不超过一层，否则局部重烘要牵连的层数就不止一层。"))
-	int32 NavLinkMaxHeightDiff = 1;
-	UPROPERTY(EditAnywhere, Category = "Voxel|Navigation", meta = (EditCondition = "bAutoSpawNavLink"))
-	TSubclassOf<UVoxelNavLinkProxy> AutoLinkProxy;
 
 	UPROPERTY(VisibleAnywhere, Category = "Voxel")
 	TObjectPtr<USceneComponent> VoxelRoot;
@@ -253,21 +180,10 @@ private:
 
 	FVoxelChunk& FindOrAddChunk(FIntVector2 ChunkCoord);
 
-	/** 改一体素时，导航在 Z 方向能牵连到多远的格子：净空向上要看 MaxAllowHeight 格，
- *  自动连接又可能把连接拉到 NavLinkMaxHeightDiff 格高 —— 取二者较大，脏区判定用它 */
-	int32 GetMaxImpactHeight() const;
-
 	UPROPERTY()
 	TMap<FIntVector2, FVoxelChunk> Chunks;
 	TMap<FIntVector2, TArray<FIntVector>> DirtySections;
 #if WITH_EDITOR
 	bool bNeedsMeshBuild = false;
 #endif
-
-	UPROPERTY()
-	TMap<FIntVector, float> NavWeights;
-	UPROPERTY()
-	TArray<FVoxelNavLinkProxyData> LinkData;
-
-	mutable TMap<FIntVector, TWeakObjectPtr<AActor>> CoordRecords;
 };

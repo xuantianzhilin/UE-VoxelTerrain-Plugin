@@ -126,14 +126,8 @@ void AVoxelTerrainActor::MarkSectionDirty(FIntVector SectionCoord, FIntVector Lo
 	if (LocalCoord.X == Voxel::LENGTH - 1)						AddNeighbor({ 1, 0, 0 });
 	if (LocalCoord.Y == 0)										AddNeighbor({ 0, -1, 0 });
 	if (LocalCoord.Y == Voxel::LENGTH - 1)						AddNeighbor({ 0, 1, 0 });
-	// 净空（AllowHeight）是从落脚格向上数的：改了某一体素，同列上「向上扫得到它」的那些落脚格就全要重算，
-	// 它们都在改动处之下、最远差 MaxAllowHeight-1 格，所以贴着底部时得连下方 Section 一起重烘。
-	// 自动连接同理：高差在 NavLinkMaxHeightDiff 内的连接，两端可以分别落在上下两层 Section 里，
-	// 所以两个方向都按 GetNavZReach() 放宽（严格来说每边还能再窄一格，这里多标一行，宁滥勿漏）。
-	// 两个上限都被夹在一层（Voxel::LENGTH）以内，故牵连范围不会超过上下各一个 Section
-	if (LocalCoord.Z < GetMaxImpactHeight())					AddNeighbor({ 0, 0, -1 });
-	if (LocalCoord.Z >= Voxel::LENGTH - GetMaxImpactHeight())	AddNeighbor({ 0, 0, 1 });
-	// Z 方向相邻 Section 必然属于同一个 Chunk（Chunk 只按 X/Y 划分），超出高度范围时 BuildMesh/BuildNavData 内部会跳过
+	if (LocalCoord.Z == 0)					AddNeighbor({ 0, 0, -1 });
+	if (LocalCoord.Z == Voxel::LENGTH - 1)	AddNeighbor({ 0, 0, 1 });
 
 	for (int32 i = 0; i < Num; ++i)
 	{
@@ -161,7 +155,6 @@ void AVoxelTerrainActor::RebuildDirtySections(int32 MaxCount)
 			if (Chunk)
 			{
 				Chunk->BuildMesh(this, SectionCoord.Z);
-				Chunk->BuildNavData(this, SectionCoord.Z);
 			}
 			--Budget;
 		}
@@ -180,12 +173,8 @@ void AVoxelTerrainActor::ClearTerrain()
 	for (auto& [ChunkCoord, Chunk] : Chunks)
 	{
 		Chunk.ClearAllMeshes();
-		Chunk.ClearAllNavData();
 	}
 	Chunks.Reset();
-	NavWeights.Reset();
-	LinkData.Reset();
-	CoordRecords.Reset();
 #if WITH_EDITOR
 	bNeedsMeshBuild = false;
 #endif
@@ -467,7 +456,6 @@ void AVoxelTerrainActor::BeginPlay()
 	Super::BeginPlay();
 
 	BuildAllMeshes();
-	BuildNavData();
 
 	if (bRunGeneratorOnBeginPlay)
 	{
@@ -547,9 +535,4 @@ FVoxelChunk& AVoxelTerrainActor::FindOrAddChunk(FIntVector2 ChunkCoord)
 	}
 
 	return Chunks.Emplace(ChunkCoord, FVoxelChunk{ ChunkCoord, MinHeight, MaxHeight });
-}
-
-int32 AVoxelTerrainActor::GetMaxImpactHeight() const
-{
-	return FMath::Max(GetMaxAllowHeight(), ShouldAutoSpawnNavLinks() ? GetNavLinkMaxHeightDiff() : 0);
 }
