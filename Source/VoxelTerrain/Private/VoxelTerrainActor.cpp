@@ -122,10 +122,13 @@ void AVoxelTerrainActor::MarkSectionDirty(FIntVector SectionCoord, FIntVector Lo
 			SectionCoords[Num++] = SectionCoord + Offset;
 		};
 
-	if (LocalCoord.X == 0)										AddNeighbor({ -1, 0, 0 });
-	if (LocalCoord.X == Voxel::LENGTH - 1)						AddNeighbor({ 1, 0, 0 });
-	if (LocalCoord.Y == 0)										AddNeighbor({ 0, -1, 0 });
-	if (LocalCoord.Y == Voxel::LENGTH - 1)						AddNeighbor({ 0, 1, 0 });
+	// 横向牵连按最大体型放宽：宽档烘焙会把 footprint 读到旁边 MaxW-1 格，改动离边界不足这个数时
+	// 邻 Section 的分档净空就变了（1×1 档时 Pad=0，退化为原来的「贴边才标邻」）
+	const int32 Pad = GetMaxImpactPad();
+	if (LocalCoord.X <= Pad)									AddNeighbor({ -1, 0, 0 });
+	if (LocalCoord.X >= Voxel::LENGTH - 1 - Pad)				AddNeighbor({ 1, 0, 0 });
+	if (LocalCoord.Y <= Pad)									AddNeighbor({ 0, -1, 0 });
+	if (LocalCoord.Y >= Voxel::LENGTH - 1 - Pad)				AddNeighbor({ 0, 1, 0 });
 	// 净空（AllowHeight）是从落脚格向上数的：改了某一体素，同列上「向上扫得到它」的那些落脚格就全要重算，
 	// 它们都在改动处之下、最远差 MaxAllowHeight-1 格，所以贴着底部时得连下方 Section 一起重烘。
 	// 自动连接同理：高差在 NavLinkMaxHeightDiff 内的连接，两端可以分别落在上下两层 Section 里，
@@ -186,6 +189,7 @@ void AVoxelTerrainActor::ClearTerrain()
 	NavWeights.Reset();
 	LinkData.Reset();
 	CoordRecords.Reset();
+	Reservations.Reset();
 #if WITH_EDITOR
 	bNeedsMeshBuild = false;
 #endif
@@ -483,6 +487,12 @@ void AVoxelTerrainActor::Tick(float DeltaTime)
 	{
 		RebuildDirtySections(MaxRebuildCountPerTick);
 	}
+
+	if (Reservations.Num() > 0)
+	{
+		// 预约是按时间窗登记的，过期条目读时也会清，但没人再查过的格子会让它们一直烂在表里 —— 定期扫一遍
+		PruneExpiredReservations(GetWorld()->GetTimeSeconds());
+	}
 }
 
 void AVoxelTerrainActor::PostRegisterAllComponents()
@@ -552,4 +562,10 @@ FVoxelChunk& AVoxelTerrainActor::FindOrAddChunk(FIntVector2 ChunkCoord)
 int32 AVoxelTerrainActor::GetMaxImpactHeight() const
 {
 	return FMath::Max(GetMaxAllowHeight(), ShouldAutoSpawnNavLinks() ? GetNavLinkMaxHeightDiff() : 0);
+}
+
+int32 AVoxelTerrainActor::GetMaxImpactPad() const
+{
+	// 最大档宽减一：footprint 从 anchor 最远向外读到这么多格（档表归一化在 GetNavFootprintWidths 里做）
+	return FMath::Max(0, GetMaxAgentFootprintWidth() - 1);
 }

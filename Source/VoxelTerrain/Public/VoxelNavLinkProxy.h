@@ -56,6 +56,13 @@ public:
 	/** 这条连接在寻路里的代价倍率，与「进入目标格的代价」相乘；<=0 表示这条连接已关闭（比如上了锁）*/
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Navigation", meta = (ClampMin = "0"))
 	float Weight = 1.f;
+	/**
+	 * 这条连接一次通过的预计耗时（秒），时空寻路（FindPathScheduled）与路径预约登记拿它算时间窗。
+	 * 读的是类默认值；只要是个「真的要做动作」的代理（跳/爬/传送各有时长）就值得如实配置，
+	 * 配得太短会让别人的预约贴脸、实际靠先占后走来兜底。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Navigation", meta = (ClampMin = "0.05"))
+	float ExpectedMoveDuration = 0.5f;
 	/** 单向：只允许 StartCoord -> Destination，反向不生成连接。读的是类默认值，在烘焙时生效 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Navigation")
 	bool bOneWay = false;

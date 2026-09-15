@@ -1,5 +1,6 @@
 #include "VoxelChunk.h"
 #include "VoxelTerrainActor.h"
+#include "Containers/Deque.h"		// 滑窗 min 的单调队列
 #include "Engine/OverlapResult.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/PrimitiveComponent.h"
@@ -254,11 +255,67 @@ namespace
 		}
 		return Height;
 	}
+
+	/* 滑窗 min 用的一维单调队列：窗口 = [i - Half, i - Half + W - 1]，越出范围的输出处记 0（=不可站）。
+	   Src/Dst 沿一条直线取元素，取索引方式是模板参数（横排连续、纵列跨行、层间跨层）。 */
+	template <typename TGetter>
+	void SlidingMin1D(TGetter Src, TArray<uint8>& Dst, int32 Count, int32 W, int32 Half)
+	{
+		Dst.SetNumUninitialized(Count);
+		TDeque<int32> Window;	// 存下标，队首恒为窗口内最小值
+		for (int32 i = 0; i < Count; ++i)
+		{
+			const int32 Right = i - Half + W - 1;
+			if (Right >= 0 && Right < Count)
+			{
+				const uint8 Val = Src(Right);
+				while (!Window.IsEmpty() && Src(Window.Last()) >= Val)
+				{
+					Window.PopLast();
+				}
+				Window.PushLast(Right);
+			}
+			const int32 Left = i - Half;
+			while (!Window.IsEmpty() && Window.First() < Left)
+			{
+				Window.PopFirst();		// 队首即窗口左沿之外的最旧下标
+			}
+			Dst[i] = (Left < 0 || Right >= Count || Window.IsEmpty()) ? 0 : Src(Window.First());
+		}
+	}
+
+	/**
+	 * 按体型 W×W 对一层「落脚净空图」做 min 侵蚀（两遍一维滑窗 min，先横后纵）。
+	 * 结果 = footprint 以 (x,y) 为 anchor、覆盖 [x-W/2, x-W/2+W-1] × 同 Y 时每列净空的 min；
+	 * 任一覆盖列为 0（不可站）或窗口越出平面则结果为 0。读写可指向同一对大数组里的第 Base 层。
+	 */
+	void ErodePlane(const TArray<uint8>& In, TArray<uint8>& Out, TArray<uint8>& Temp,
+		int32 Base, int32 SizeX, int32 SizeY, int32 W, int32 Half)
+	{
+		// 横向：逐行滑窗，结果按行写回 Out 同一层（纵向遍以此为输入）
+		for (int32 y = 0; y < SizeY; ++y)
+		{
+			const int32 Row = Base + y * SizeX;
+			SlidingMin1D([Row, &In](int32 Idx) { return In[Row + Idx]; }, Temp, SizeX, W, Half);
+			FMemory::Memcpy(Out.GetData() + Row, Temp.GetData(), SizeX);
+		}
+		// 纵向：逐列对 Out 再滑一次（列内先收进缓冲再写回，读写不互相踩）
+		TArray<uint8> Col;
+		Col.SetNumUninitialized(SizeY);
+		for (int32 x = 0; x < SizeX; ++x)
+		{
+			SlidingMin1D([x, Base, SizeX, &Out](int32 Idx) { return Out[Base + Idx * SizeX + x]; }, Col, SizeY, W, Half);
+			for (int32 y = 0; y < SizeY; ++y)
+			{
+				Out[Base + y * SizeX + x] = Col[y];
+			}
+		}
+	}
 }
 
 void FVoxelSection::BuildNavData(const AVoxelTerrainActor* Terrain)
 {
-	NavData.Reset();
+	NavDataByTier.Reset();	// 先清表：烘焙中途提前 return 时也不留旧档表
 	if (!Terrain)
 	{
 		return;
@@ -274,17 +331,26 @@ void FVoxelSection::BuildNavData(const AVoxelTerrainActor* Terrain)
 	const int32 LinkReachZ = bAutoLinks ? Terrain->GetNavLinkMaxHeightDiff() : 0;
 	const TSubclassOf<UVoxelNavLinkProxy> AutoProxyClass = bAutoLinks ? Terrain->GetAutoNavLinkProxyClass() : nullptr;
 
+	/* 体型档表（升序、去重、恒含 1，见 AVoxelTerrainActor::GetNavFootprintWidths）。
+	   宽档 = 把单列净空图按 W×W 滑窗 min 侵蚀；档 0 与旧数据完全一致。
+	   footprint 以落脚格为 anchor：向 -X/-Y 覆盖 W/2 格、向 +X/+Y 覆盖 (W-1)-W/2 格。 */
+	const TArray<int32>& TierWidths = Terrain->GetNavFootprintWidths();
+	const int32 MaxW = TierWidths.Num() > 0 ? TierWidths.Last() : 1;
+
 	const FIntVector SectionOrigin = SectionCoord * LENGTH;
-	// 落脚判定用的窄带：本 Section 外扩一圈，X/Y 各 ±1 覆盖水平 4 邻格，
+	// 落脚判定用的窄带：本 Section 在 X/Y 外扩 max(1, MaxW-1) —— 水平邻格与宽档 footprint 都会越出本层边界，
+	// 外扩量保证「本层 anchor 的整块 footprint」都落在窄带内；
 	// Z 下扩 LinkReachZ+1 覆盖邻格的支撑格（判断“可站立”要往下看一格），上扩 LinkReachZ 覆盖台阶。
 	// 净空只从落脚格向上数 MaxAllowHeight 格，所以查询区域只要铺到最高落脚格之上这么多格即可。
 	const int32 BottomZ = SectionOrigin.Z - (LinkReachZ + 1);
 	const int32 HighestStandableZ = SectionOrigin.Z + LENGTH + LinkReachZ;					// 邻格可能站到的最高一层
 	const int32 TopZ = FMath::Max(HighestStandableZ, SectionOrigin.Z + LENGTH - 1 + MaxAllowHeight - 1);
 
-	const int32 XYSize = LENGTH + 2;
-	const FIntVector PaddedMin(SectionOrigin.X - 1, SectionOrigin.Y - 1, BottomZ);
-	const FNavRegion StandRegion{ PaddedMin, FIntVector(XYSize, XYSize, HighestStandableZ - BottomZ + 1) };
+	const int32 XYHalfPad = FMath::Max(1, MaxW - 1);
+	const int32 XYSize = LENGTH + 2 * XYHalfPad;
+	const int32 StandLayers = HighestStandableZ - BottomZ + 1;
+	const FIntVector PaddedMin(SectionOrigin.X - XYHalfPad, SectionOrigin.Y - XYHalfPad, BottomZ);
+	const FNavRegion StandRegion{ PaddedMin, FIntVector(XYSize, XYSize, StandLayers) };
 	// 阻碍查询要盖到净空看得到的最高处：头顶的桥、屋檐会压低下方落脚格的净空
 	const FNavRegion QueryRegion{ PaddedMin, FIntVector(XYSize, XYSize, TopZ - BottomZ + 1) };
 
@@ -317,6 +383,29 @@ void FVoxelSection::BuildNavData(const AVoxelTerrainActor* Terrain)
 			return !Grid.IsSolid(Coord) && Grid.IsSolid(Coord - FIntVector(0, 0, 1));
 		};
 
+	// 3) 基础净空图：窄带内每个可站格的「单列净空」（封顶 MaxAllowHeight），不可站记 0。
+	//    宽档直接在这张图上做 min 侵蚀、不再回查体素，所以整带都要铺（不只本 Section 那 16 层）。
+	const int32 PlaneSize = XYSize * XYSize;
+	TArray<uint8> FootClear;
+	FootClear.SetNumZeroed(PlaneSize * StandLayers);
+	for (int32 z = 0; z < StandLayers; ++z)
+	{
+		for (int32 y = 0; y < XYSize; ++y)
+		{
+			for (int32 x = 0; x < XYSize; ++x)
+			{
+				const FIntVector Coord = StandRegion.Min + FIntVector(x, y, z);
+				if (IsStandable(Coord))
+				{
+					FootClear[(z * XYSize + y) * XYSize + x] =
+						static_cast<uint8>(ComputeNavClearance(Grid, Reader, Obstacles, Coord, MaxAllowHeight));
+				}
+			}
+		}
+	}
+
+	NavDataByTier.SetNum(TierWidths.Num());
+
 	auto GlobalToLocalSection = [](const FIntVector& Coord)
 		{
 			return FIntVector(FloorDivide(Coord.X, LENGTH), FloorDivide(Coord.Y, LENGTH), FloorDivide(Coord.Z, LENGTH));
@@ -340,7 +429,7 @@ void FVoxelSection::BuildNavData(const AVoxelTerrainActor* Terrain)
 			Link.ProxyClass = ProxyClass;
 		};
 
-	// 3) 手动连接先按「端点是否落在本 Section」分两堆：作为起点（正着连）与作为终点（非单向时反向补一条）
+	// 4) 手动连接先按「端点是否落在本 Section」分两堆：作为起点（正着连）与作为终点（非单向时反向补一条）
 	auto IsInThisSection = [SectionOrigin](const FIntVector& Coord)
 		{
 			return Coord.X >= SectionOrigin.X && Coord.X < SectionOrigin.X + LENGTH
@@ -375,77 +464,121 @@ void FVoxelSection::BuildNavData(const AVoxelTerrainActor* Terrain)
 		}
 	}
 
-	// 4) 逐格出节点与连接
+	// 5) 逐档出节点与连接。每档一张「footprint 净空图」TierClear：非 0 即整块 footprint 可站，
+	//    值就是覆盖列净空的 min；节点与连接判定只看这张图。4 邻移动扫过的位置并集恰为两端
+	//    footprint（格子图只有轴向迈步，没有斜步，拐角天然安全），所以「两端都是本档节点」
+	//    就是平面连接对本档成立的充要判据；台阶连接取保守判据（两端整块可站，不查抬脚瞬间）。
 	static const FIntVector Directions[4] = {
 		FIntVector(1, 0, 0), FIntVector(-1, 0, 0), FIntVector(0, 1, 0), FIntVector(0, -1, 0) };
 
-	for (int32 z = 0; z < LENGTH; ++z)
+	auto EmitTier = [&](int32 Tier, const TArray<uint8>& TierClear)
 	{
-		for (int32 y = 0; y < LENGTH; ++y)
+		auto ClearAt = [&](const FIntVector& C) -> uint8
 		{
-			for (int32 x = 0; x < LENGTH; ++x)
+			const int32 RelX = C.X - PaddedMin.X;
+			const int32 RelY = C.Y - PaddedMin.Y;
+			const int32 RelZ = C.Z - BottomZ;
+			if (RelX < 0 || RelY < 0 || RelZ < 0 || RelZ >= StandLayers || RelX >= XYSize || RelY >= XYSize)
 			{
-				const FIntVector LocalCoord(x, y, z);
-				const FIntVector Coord = SectionOrigin + LocalCoord;
-				if (!IsStandable(Coord))
-				{
-					continue;
-				}
+				return 0;		// 窄带外 = 不可站（外扩量保证本层 anchor 与各档 footprint 不会真越出去）
+			}
+			return TierClear[(RelZ * XYSize + RelY) * XYSize + RelX];
+		};
 
-				// 可站但没有邻居的格也要留一条记录：Key 存在即代表这一格能站
-				FVoxelNavCell& Cell = NavData.Add(LocalCoord);
-				Cell.AllowHeight = ComputeNavClearance(Grid, Reader, Obstacles, Coord, MaxAllowHeight);
-
-				for (const FIntVector& Direction : Directions)
+		TMap<FIntVector, FVoxelNavCell>& TierMap = NavDataByTier[Tier];
+		for (int32 z = 0; z < LENGTH; ++z)
+		{
+			for (int32 y = 0; y < LENGTH; ++y)
+			{
+				for (int32 x = 0; x < LENGTH; ++x)
 				{
-					// 平面连接：同层的水平 4 邻，不挂代理
-					const FIntVector Side = Coord + Direction;
-					if (IsStandable(Side))
+					const FIntVector LocalCoord(x, y, z);
+					const FIntVector Coord = SectionOrigin + LocalCoord;
+					const uint8 SelfClear = ClearAt(Coord);
+					if (SelfClear == 0)
 					{
-						AddLink(Cell, Side, nullptr);
+						continue;		// 本档站不下
 					}
 
-					// 自动连接：高差在 NavLinkMaxHeightDiff 内的上下台阶，挂自动代理
-					if (bAutoLinks)
+					// 可站但没有邻居的格也要留一条记录：Key 存在即代表这一格能站
+					FVoxelNavCell& Cell = TierMap.Add(LocalCoord);
+					Cell.AllowHeight = SelfClear;
+
+					for (const FIntVector& Direction : Directions)
 					{
-						for (int32 DeltaZ = 1; DeltaZ <= LinkReachZ; ++DeltaZ)
+						// 平面连接：同层的水平 4 邻，不挂代理
+						const FIntVector Side = Coord + Direction;
+						if (ClearAt(Side) > 0)
 						{
-							const FIntVector Up = Side + FIntVector(0, 0, DeltaZ);
-							if (IsStandable(Up))
+							AddLink(Cell, Side, nullptr);
+						}
+
+						// 自动连接：高差在 NavLinkMaxHeightDiff 内的上下台阶，挂自动代理
+						if (bAutoLinks)
+						{
+							for (int32 DeltaZ = 1; DeltaZ <= LinkReachZ; ++DeltaZ)
 							{
-								AddLink(Cell, Up, AutoProxyClass);
-							}
-							const FIntVector Down = Side - FIntVector(0, 0, DeltaZ);
-							if (IsStandable(Down))
-							{
-								AddLink(Cell, Down, AutoProxyClass);
+								const FIntVector Up = Side + FIntVector(0, 0, DeltaZ);
+								if (ClearAt(Up) > 0)
+								{
+									AddLink(Cell, Up, AutoProxyClass);
+								}
+								const FIntVector Down = Side - FIntVector(0, 0, DeltaZ);
+								if (ClearAt(Down) > 0)
+								{
+									AddLink(Cell, Down, AutoProxyClass);
+								}
 							}
 						}
 					}
-				}
 
-				// 手动连接：另一端可能在本 Section 之外任意远，所以不校验对方的可站性 ——
-				// 对方没被烘成落脚格时，A* 查询会因为查不到它的记录而自然忽略这条连接
-				if (const TArray<const FVoxelNavLinkProxyData*>* FromHere = ByStart.Find(Coord))
-				{
-					for (const FVoxelNavLinkProxyData* Data : *FromHere)
+					// 手动连接：另一端可能在本 Section 之外任意远，所以不校验对方的可站性 ——
+					// 对方没被烘成落脚格时，A* 查询会因为查不到它的记录而自然忽略这条连接
+					if (const TArray<const FVoxelNavLinkProxyData*>* FromHere = ByStart.Find(Coord))
 					{
-						AddLink(Cell, Data->Destination, Data->ProxyClass);
-					}
-				}
-				if (const TArray<const FVoxelNavLinkProxyData*>* ToHere = ByDestination.Find(Coord))
-				{
-					for (const FVoxelNavLinkProxyData* Data : *ToHere)
-					{
-						if (!IsOneWay(Data->ProxyClass))
+						for (const FVoxelNavLinkProxyData* Data : *FromHere)
 						{
-							AddLink(Cell, Data->StartCoord, Data->ProxyClass);
+							AddLink(Cell, Data->Destination, Data->ProxyClass);
+						}
+					}
+					if (const TArray<const FVoxelNavLinkProxyData*>* ToHere = ByDestination.Find(Coord))
+					{
+						for (const FVoxelNavLinkProxyData* Data : *ToHere)
+						{
+							if (!IsOneWay(Data->ProxyClass))
+							{
+								AddLink(Cell, Data->StartCoord, Data->ProxyClass);
+							}
 						}
 					}
 				}
 			}
 		}
+	};
+
+	TArray<uint8> TierClear;
+	TArray<uint8> ErodeTemp;
+	for (int32 Tier = 0; Tier < TierWidths.Num(); ++Tier)
+	{
+		const int32 W = TierWidths[Tier];
+		if (W <= 1)
+		{
+			EmitTier(Tier, FootClear);		// 档 0：footprint 就是单列本身，净空图直接用
+			continue;
+		}
+		TierClear = FootClear;
+		for (int32 z = 0; z < StandLayers; ++z)
+		{
+			ErodePlane(FootClear, TierClear, ErodeTemp, z * PlaneSize, XYSize, XYSize, W, W / 2);
+		}
+		EmitTier(Tier, TierClear);
 	}
+}
+
+const TMap<FIntVector, FVoxelNavCell>& FVoxelSection::GetNavTierData(int32 Tier) const
+{
+	static const TMap<FIntVector, FVoxelNavCell> Empty;
+	return NavDataByTier.IsValidIndex(Tier) ? NavDataByTier[Tier] : Empty;
 }
 
 void FVoxelChunk::BuildNavData(AVoxelTerrainActor* Terrain, int32 CoordZ)

@@ -1,5 +1,5 @@
-// 导航数据的运行期侧：全量烘焙、区域通行权重、A* 查询。
-// 烘焙只决定"能不能走"，代价（权重）是查询期按格乘上去的，两者互不依赖。
+// 导航数据的运行期侧：全量烘焙、区域通行权重、AI 占地与时空预约、A* 查询（空间 / 时空两种模式）。
+// 烘焙只决定"能不能走"（按体型档），代价（权重）与预约是查询期按格叠加的，三者互不依赖。
 
 #include "VoxelTerrainActor.h"
 #include "VoxelPathFollowingComponent.h"
@@ -118,7 +118,7 @@ void AVoxelTerrainActor::BuildNavData()
 /* ===================== 区域通行权重 =====================
    权重是查询期数据：烘焙只决定“能不能走”，代价由寻路时按格乘上去，
    所以刷权重既不触发重烘、烘焙也不会读它。
-   语义：1 = 正常，>1 = 更难走，0 = 软墙（格能站、但没人愿意绕过来）。
+   语义：1 = 正常，>1 = 更难走，0 = 软墙（格能站但没人愿意绕过来）。
    表里只存与默认值 1 不同的格，等于 1 的写入按“清除”处理。 */
 
 void AVoxelTerrainActor::SetCoordNavWeight(FIntVector Coord, float Weight)
@@ -261,10 +261,96 @@ void AVoxelTerrainActor::RebuildLinksAround(const FVoxelNavLinkProxyData& ProxyD
 	}
 }
 
+/* ===================== 体型档与 footprint 口径 =====================
+   档表归一化（升序、去重、恒含 1）是烘焙、寻路、占地共同的口径来源。 */
+
+TArray<int32> AVoxelTerrainActor::GetNavFootprintWidths() const
+{
+	TArray<int32> Sorted = AgentFootprintWidths;
+	for (int32& W : Sorted)
+	{
+		W = FMath::Clamp(W, 1, 8);		// 上限 8 < Section 边长 16：footprint 牵连不越过相邻 Section
+	}
+	Sorted.Add(1);						// 档 0 恒为 1×1（旧图），没配也得有
+	Sorted.Sort();
+	TArray<int32> Result;
+	Result.Reserve(Sorted.Num());
+	for (const int32 W : Sorted)
+	{
+		if (Result.IsEmpty() || Result.Last() != W)		// 排序后线性去重（UE 的 TArray 没有 RemoveDuplicates）
+		{
+			Result.Add(W);
+		}
+	}
+	return Result;
+}
+
+int32 AVoxelTerrainActor::ResolveNavTier(int32 Width) const
+{
+	// 不做「就近取档」：请求没烘的体型是配置错误，悄悄换成别的体型比找不到路更危险
+	return GetNavFootprintWidths().IndexOfByKey(FMath::Clamp(Width, 1, 8));
+}
+
+int32 AVoxelTerrainActor::GetMaxAgentFootprintWidth() const
+{
+	const TArray<int32> Widths = GetNavFootprintWidths();
+	return Widths.Last();				// 升序且恒含 1，末尾即最大
+}
+
+void AVoxelTerrainActor::ConfigureAgentSizes(const TArray<int32>& Widths)
+{
+	AgentFootprintWidths = Widths;
+	// footprint 分档是烘在 NavData 里的，改表必须重烘才生效（量级同 ConfigureAutoNavLinks，不是廉价操作）
+	BuildNavData();
+}
+
+FIntVector AVoxelTerrainActor::FootprintOrigin(const FIntVector& Anchor, int32 Width)
+{
+	const int32 Half = FMath::Max(Width, 1) / 2;
+	return Anchor - FIntVector(Half, Half, 0);
+}
+
+FVector AVoxelTerrainActor::FootprintCenterToWorld(FIntVector Anchor, int32 AgentWidth) const
+{
+	FVector Loc = CoordToWorldLocation(Anchor);
+	if ((FMath::Max(AgentWidth, 1) & 1) == 0)
+	{
+		// 偶数档：footprint 中心在 anchor 格心的 -X/-Y 各半格处（覆盖方向见 FootprintOrigin）
+		Loc.X -= VoxelSize.X * 0.5;
+		Loc.Y -= VoxelSize.Y * 0.5;
+	}
+	return Loc;
+}
+
+FIntVector AVoxelTerrainActor::WorldToFootprintAnchor(const FVector& WorldLocation, int32 AgentWidth) const
+{
+	FVector Local = GetActorTransform().InverseTransformPosition(WorldLocation) / VoxelSize;
+	// FootprintCenterToWorld 的逆：奇数档中心在格心（Local = anchor + 0.5），偶数档正落在 anchor 整数位
+	const double Bias = (FMath::Max(AgentWidth, 1) & 1) ? 0.5 : 0.0;
+	return FIntVector(
+		FMath::RoundToInt32(Local.X - Bias),
+		FMath::RoundToInt32(Local.Y - Bias),
+		FMath::FloorToInt32(Local.Z));
+}
+
+const FVoxelNavCell* AVoxelTerrainActor::FindNavCellAtTier(const FIntVector& GlobalCoord, int32 Tier) const
+{
+	const TPair<FIntVector, FIntVector> Split = WorldCoordToSectionLocalCoord(GlobalCoord);
+	const FVoxelSection* Section = GetChunkSection(Split.Key);
+	return Section ? Section->GetNavTierData(Tier).Find(Split.Value) : nullptr;
+}
+
+const FVoxelNavCell* AVoxelTerrainActor::FindNavCell(const FIntVector& GlobalCoord, int32 AgentWidth) const
+{
+	const int32 Tier = ResolveNavTier(AgentWidth);
+	return Tier == INDEX_NONE ? nullptr : FindNavCellAtTier(GlobalCoord, Tier);
+}
+
 /* ===================== AI 占地 =====================
-   一张「格子 -> AI」的弱引用表，落实约定的「一个 AI 只占一格，一格同时只有一个 AI」。
-   移动器在跨进下一格之前先把它登记下来（预约制），所以既不会出现两个 AI 挤同一格，
-   也不会出现两个 AI 对穿（双方都想进对方那格时，慢的一方根本占不到，只能在原地等）。 */
+   一张「格子 -> AI」的弱引用表，落实「一格同时只有一个 AI」。宽体型的 AI 整体占住它的 footprint
+   （覆盖的每一格都登记），所以别人的寻路/让行判定只看单格占用表就天然正确。
+   移动器在跨进下一格之前先把它占下来（先占后走，见 UVoxelPathFollowingComponent），
+   所以既不会出现两个 AI 挤同一格，也不会对穿（双方都想进对方那格时，谁都没拿到，只能原地等）。 */
 
 bool AVoxelTerrainActor::TryOccupyCoord(FIntVector Coord, AActor* Occupant)
 {
@@ -309,16 +395,80 @@ AActor* AVoxelTerrainActor::GetCoordOccupant(const FIntVector& Coord) const
 	return nullptr;
 }
 
-const FVoxelNavCell* AVoxelTerrainActor::FindNavCell(const FIntVector& GlobalCoord) const
+bool AVoxelTerrainActor::TryOccupyFootprint(FIntVector Anchor, int32 AgentWidth, AActor* Occupant)
 {
-	const TPair<FIntVector, FIntVector> Split = WorldCoordToSectionLocalCoord(GlobalCoord);
-	const FVoxelSection* Section = GetChunkSection(Split.Key);
-	return Section ? Section->GetNavData().Find(Split.Value) : nullptr;
+	const int32 W = FMath::Max(AgentWidth, 1);
+	const FIntVector Origin = FootprintOrigin(Anchor, W);
+
+	// 先整块校验再整块写入：任何一格被**别人**占着就一格都不写（同一 Occupant 已占的格视作已有）
+	for (int32 y = 0; y < W; ++y)
+	{
+		for (int32 x = 0; x < W; ++x)
+		{
+			if (AActor* Holder = GetCoordOccupant(Origin + FIntVector(x, y, 0)))
+			{
+				if (Holder != Occupant)
+				{
+					return false;
+				}
+			}
+		}
+	}
+	for (int32 y = 0; y < W; ++y)
+	{
+		for (int32 x = 0; x < W; ++x)
+		{
+			CoordRecords.Emplace(Origin + FIntVector(x, y, 0), Occupant);
+		}
+	}
+	return true;
 }
 
-TArray<TPair<FIntVector, float>> AVoxelTerrainActor::FindFreeNearbyCoord(FIntVector Target, int32 AgentHeight, int32 Radius) const
+void AVoxelTerrainActor::ReleaseFootprint(FIntVector Anchor, int32 AgentWidth, AActor* Occupant)
+{
+	const int32 W = FMath::Max(AgentWidth, 1);
+	const FIntVector Origin = FootprintOrigin(Anchor, W);
+	for (int32 y = 0; y < W; ++y)
+	{
+		for (int32 x = 0; x < W; ++x)
+		{
+			const FIntVector Cell = Origin + FIntVector(x, y, 0);
+			if (GetCoordOccupant(Cell) == Occupant)		// 不是自己占的（出生时就被挡的格）静默跳过，不打高频日志
+			{
+				CoordRecords.Remove(Cell);
+			}
+		}
+	}
+}
+
+bool AVoxelTerrainActor::IsFootprintBlocked(FIntVector Anchor, int32 AgentWidth, const AActor* IgnoreAgent) const
+{
+	const int32 W = FMath::Max(AgentWidth, 1);
+	const FIntVector Origin = FootprintOrigin(Anchor, W);
+	for (int32 y = 0; y < W; ++y)
+	{
+		for (int32 x = 0; x < W; ++x)
+		{
+			const AActor* Holder = GetCoordOccupant(Origin + FIntVector(x, y, 0));
+			if (Holder && Holder != IgnoreAgent)
+			{
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+TArray<TPair<FIntVector, float>> AVoxelTerrainActor::FindFreeNearbyCoord(FIntVector Target, int32 AgentHeight, int32 Radius, int32 AgentWidth) const
 {
 	TArray<TPair<FIntVector, float>> Result;
+
+	const int32 Tier = ResolveNavTier(AgentWidth);
+	if (Tier == INDEX_NONE)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[Voxel] 吸附按体型 %d 格查询，但地形没烘这一档，返回空（检查 AgentFootprintWidths）"), FMath::Max(AgentWidth, 1));
+		return Result;
+	}
 
 	const int32 Height = FMath::Max(AgentHeight, 1);
 	const int32 Range = FMath::Clamp(Radius, 0, MaxSnapRadius);
@@ -330,8 +480,8 @@ TArray<TPair<FIntVector, float>> AVoxelTerrainActor::FindFreeNearbyCoord(FIntVec
 			for (int32 dx = -Range; dx <= Range; ++dx)
 			{
 				const FIntVector Candidate{ Target.X + dx, Target.Y + dy, Target.Z + dz };
-				const FVoxelNavCell* Cell = FindNavCell(Candidate);
-				if (Cell && Cell->AllowHeight >= AgentHeight && !GetCoordOccupant(Candidate))
+				const FVoxelNavCell* Cell = FindNavCellAtTier(Candidate, Tier);
+				if (Cell && Cell->AllowHeight >= Height && !IsFootprintBlocked(Candidate, AgentWidth))
 				{
 					Result.Emplace(Candidate, GetCoordNavWeight(Candidate));
 				}
@@ -341,13 +491,199 @@ TArray<TPair<FIntVector, float>> AVoxelTerrainActor::FindFreeNearbyCoord(FIntVec
 	return Result;
 }
 
-/* ===================== A* 寻路 =====================
-   只走烘焙好的导航图（FVoxelSection::NavData 里的正交 4 邻 Link），不涉及 NavMesh，查询期也不现查体素。
-   图是无向的 —— 烘焙时对每一对走得通的邻格双向都写了 Link，所以只顺着 Links 前进就能到任意可达格。 */
+/* ===================== 时空预约（群体避让的软规划层） =====================
+   预约记录「某 AI 预计何时占某格」。规划期（FindPathScheduled / CommitPathReservations）按时间窗绕开它；
+   运行期的正确性由逐格硬占地（先占后走）兜底 —— 实际早到/晚到只会影响流畅度，不会造成重叠。 */
 
-TArray<FVoxelPathPoint> AVoxelTerrainActor::FindPath(FIntVector StartCoord, FIntVector EndCoord, int32 AgentHeight) const
+float AVoxelTerrainActor::HopDurationSeconds(const FVoxelPathPoint& ToPoint, float BaseSecondsPerStep) const
+{
+	const float Base = FMath::Max(BaseSecondsPerStep, 0.01f);
+	const float Weight = FMath::Max(1.f, GetCoordNavWeight(ToPoint.Coord));	// 只罚不奖，与代价口径一致
+	if (ToPoint.LinkClass)
+	{
+		const UVoxelNavLinkProxy* ProxyCDO = ToPoint.LinkClass->GetDefaultObject<UVoxelNavLinkProxy>();
+		if (ProxyCDO && ProxyCDO->Weight > 0.f)
+		{
+			return FMath::Max(Base, ProxyCDO->ExpectedMoveDuration * FMath::Max(1.f, ProxyCDO->Weight) * Weight);
+		}
+	}
+	return Base * Weight;
+}
+
+void AVoxelTerrainActor::PruneExpiredReservations(float NowSeconds)
+{
+	static constexpr float Grace = 2.f;		// 过窗后再留一会儿：正在被读的那条别在循环中途凭空消失
+	for (auto It = Reservations.CreateIterator(); It; ++It)
+	{
+		It->Value.RemoveAll([NowSeconds](const FNavReservation& R)
+			{
+				return R.tExit + Grace < NowSeconds || !R.Agent.IsValid();
+			});
+		if (It->Value.IsEmpty())
+		{
+			It.RemoveCurrent();
+		}
+	}
+}
+
+bool AVoxelTerrainActor::IsCoordReservedAt(const FIntVector& Coord, float tEnter, float tExit, const AActor* IgnoreAgent, const FIntVector* SwapFrom) const
+{
+	// 窗口相接不算冲突：一条预约恰好在对方进入的瞬间结束（先出后进）是合法的接力
+	auto ScanKey = [&](const FIntVector& Key, bool bSwapCheck)
+	{
+		const TArray<FNavReservation>* List = Reservations.Find(Key);
+		if (!List)
+		{
+			return false;
+		}
+		for (const FNavReservation& R : *List)
+		{
+			if (R.tExit <= tEnter || R.tEnter >= tExit)
+			{
+				continue;						// 时间窗不重叠
+			}
+			if (bSwapCheck && R.From != Coord)	// 对穿判定：对方的移动是 Coord -> Key，我方是 Key -> Coord
+			{
+				continue;
+			}
+			const AActor* Owner = R.Agent.Get();
+			if (!Owner || (IgnoreAgent && Owner == IgnoreAgent))
+			{
+				continue;						// 已失效（等着被清扫）或自己的预约
+			}
+			return true;
+		}
+		return false;
+	};
+
+	if (ScanKey(Coord, false))
+	{
+		return true;
+	}
+	return SwapFrom && ScanKey(*SwapFrom, true);
+}
+
+bool AVoxelTerrainActor::CommitPathReservations(AActor* Agent, const TArray<FVoxelPathPoint>& Path, int32 AgentWidth,
+	float SecondsPerStep, float NowSeconds, float& OutTravelTime)
+{
+	OutTravelTime = 0.f;
+	if (!Agent || Path.Num() <= 1)
+	{
+		return false;		// 零跳（原地对齐）不必登记
+	}
+
+	const float Base = FMath::Max(SecondsPerStep, 0.01f);
+	const int32 W = FMath::Max(AgentWidth, 1);
+	// 终点格的尾窗：到位后还会站一会儿（别人规划时要把这段时间也算成占用）
+	const float Tail = FMath::Max(Base, 0.5f);
+
+	// 1) 先排时刻表：Times[i] = 预计到达第 i 个点的时刻（与 FindPathScheduled 共享 HopDurationSeconds 口径）
+	TArray<float> Times;
+	Times.SetNumUninitialized(Path.Num());
+	Times[0] = NowSeconds;
+	for (int32 i = 1; i < Path.Num(); ++i)
+	{
+		Times[i] = Times[i - 1] + HopDurationSeconds(Path[i], Base);
+	}
+	OutTravelTime = Times.Last() - NowSeconds;
+
+	auto WindowOfNode = [&](int32 i, float& OutEnter, float& OutExit)
+	{
+		OutEnter = Times[i];
+		OutExit = (i + 1 < Path.Num()) ? Times[i + 1] : Times[i] + Tail;
+	};
+
+	// 2) 整条全部冲突检测通过才写入（原子提交）：宁可这次不登记（退回纯空间避让），也不登记半条误导别人
+	for (int32 i = 0; i < Path.Num(); ++i)
+	{
+		float tEnter = 0.f, tExit = 0.f;
+		WindowOfNode(i, tEnter, tExit);
+		const bool bHasHop = i > 0;
+		const FIntVector Prev = bHasHop ? Path[i - 1].Coord : FIntVector::ZeroValue;
+		const FIntVector Origin = FootprintOrigin(Path[i].Coord, W);
+		for (int32 y = 0; y < W; ++y)
+		{
+			for (int32 x = 0; x < W; ++x)
+			{
+				const FIntVector Cell = Origin + FIntVector(x, y, 0);
+				if (IsCoordReservedAt(Cell, tEnter, tExit, Agent, bHasHop ? &Prev : nullptr))
+				{
+					return false;
+				}
+			}
+		}
+	}
+
+	// 3) 登记：footprint 展开到覆盖的每一格
+	for (int32 i = 0; i < Path.Num(); ++i)
+	{
+		float tEnter = 0.f, tExit = 0.f;
+		WindowOfNode(i, tEnter, tExit);
+		const FIntVector From = i > 0 ? Path[i - 1].Coord : Path[0].Coord;
+		const FIntVector Origin = FootprintOrigin(Path[i].Coord, W);
+		for (int32 y = 0; y < W; ++y)
+		{
+			for (int32 x = 0; x < W; ++x)
+			{
+				FNavReservation& Slot = Reservations.FindOrAdd(Origin + FIntVector(x, y, 0)).AddDefaulted_GetRef();
+				Slot.Agent = Agent;
+				Slot.tEnter = tEnter;
+				Slot.tExit = tExit;
+				Slot.From = From;
+			}
+		}
+	}
+	return true;
+}
+
+void AVoxelTerrainActor::RemoveReservationsFor(const AActor* Agent)
+{
+	if (!Agent)
+	{
+		return;
+	}
+	for (auto It = Reservations.CreateIterator(); It; ++It)
+	{
+		It->Value.RemoveAll([Agent](const FNavReservation& R) { return R.Agent.Get() == Agent; });
+		if (It->Value.IsEmpty())
+		{
+			It.RemoveCurrent();
+		}
+	}
+}
+
+/* ===================== A* 寻路 =====================
+   只走烘焙好的导航图（按体型档取 FVoxelSection::NavDataByTier 里的正交 4 邻 Link），不涉及 NavMesh，
+   查询期也不现查体素。图是无向的 —— 烘焙时对每一对走得通的邻格双向都写了 Link，只顺着 Links 就能到任意可达格。
+   两种模式共享同一套展开逻辑：
+     - 空间模式（FindPath）：代价是抽象单位（权重只罚不奖，启发式按「一步至少一个单位」），避让只看逐格硬占用；
+     - 时空模式（FindPathScheduled）：代价就是秒（G 值 = 预计到达时刻），在硬占用之外再躲开预约表的时间窗与对穿。
+   时空模式不安排「原地等待」（那要给状态加时间维）；真撞上时由跟随组件的先占后走/让行兜底。 */
+
+TArray<FVoxelPathPoint> AVoxelTerrainActor::FindPath(FIntVector StartCoord, FIntVector EndCoord, int32 AgentHeight, int32 AgentWidth, const AActor* IgnoreAgent) const
+{
+	float Unused = 0.f;
+	return FindPathInternal(StartCoord, EndCoord, AgentHeight, AgentWidth, IgnoreAgent, false, 0.f, 0.f, Unused);
+}
+
+TArray<FVoxelPathPoint> AVoxelTerrainActor::FindPathScheduled(FIntVector StartCoord, FIntVector EndCoord, int32 AgentHeight, int32 AgentWidth,
+	const AActor* Agent, float SecondsPerStep, float StartDelay, float& OutTravelTime) const
+{
+	return FindPathInternal(StartCoord, EndCoord, AgentHeight, AgentWidth, Agent, true, SecondsPerStep, StartDelay, OutTravelTime);
+}
+
+TArray<FVoxelPathPoint> AVoxelTerrainActor::FindPathInternal(FIntVector StartCoord, FIntVector EndCoord, int32 AgentHeight, int32 AgentWidth,
+	const AActor* IgnoreAgent, bool bScheduled, float SecondsPerStep, float StartDelay, float& OutTravelTime) const
 {
 	TArray<FVoxelPathPoint> Result;
+
+	const int32 Tier = ResolveNavTier(AgentWidth);
+	if (Tier == INDEX_NONE)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[Voxel] 寻路按体型 %d 格查询，但地形没烘这一档，返回空（检查 AgentFootprintWidths）"), FMath::Max(AgentWidth, 1));
+		return Result;
+	}
+	const int32 Width = FMath::Max(AgentWidth, 1);
 
 	if (StartCoord == EndCoord)
 	{
@@ -355,9 +691,13 @@ TArray<FVoxelPathPoint> AVoxelTerrainActor::FindPath(FIntVector StartCoord, FInt
 		return Result;
 	}
 
+	// 时空模式：代价口径就是「秒」，启发式按基准步时缩放下界；空间模式维持「一步至少一个单位」的旧口径
+	const float BaseSeconds = FMath::Max(SecondsPerStep, 0.01f);
+	const float StepUnit = bScheduled ? BaseSeconds : 1.f;
+
 	const int32 Height = FMath::Max(AgentHeight, 1);
-	const FVoxelNavCell* StartCell = FindNavCell(StartCoord);
-	const FVoxelNavCell* EndCell = FindNavCell(EndCoord);
+	const FVoxelNavCell* StartCell = FindNavCellAtTier(StartCoord, Tier);
+	const FVoxelNavCell* EndCell = FindNavCellAtTier(EndCoord, Tier);
 
 	if (!StartCell || !EndCell)
 	{
@@ -374,8 +714,9 @@ TArray<FVoxelPathPoint> AVoxelTerrainActor::FindPath(FIntVector StartCoord, FInt
 	TSet<FVoxelPathPoint> Closed;
 	FOpenHeap Open;
 
-	GScore.Add(StartCoord, 0.f);
-	Open.Push({ NavHeuristic(StartCoord, EndCoord), StartCoord });
+	const float StartG = bScheduled ? StartDelay : 0.f;
+	GScore.Add(StartCoord, StartG);
+	Open.Push({ StartG + NavHeuristic(StartCoord, EndCoord) * StepUnit, StartCoord });
 
 	int32 Expansions = 0;
 	FOpenNode Current;
@@ -388,6 +729,10 @@ TArray<FVoxelPathPoint> AVoxelTerrainActor::FindPath(FIntVector StartCoord, FInt
 		if (Current.Point.Coord == EndCoord)
 		{
 			// 终点在“弹出”时确认，配合一致性启发式，此时的 g 已经是到它的最短代价
+			if (bScheduled)
+			{
+				OutTravelTime = GScore[Current.Point] - StartDelay;
+			}
 			for (FVoxelPathPoint Node = Current.Point; ; )
 			{
 				Result.Emplace(Node);
@@ -412,7 +757,7 @@ TArray<FVoxelPathPoint> AVoxelTerrainActor::FindPath(FIntVector StartCoord, FInt
 		}
 
 		const float CurrentG = GScore[Current.Point];
-		const FVoxelNavCell* Cell = FindNavCell(Current.Point.Coord);
+		const FVoxelNavCell* Cell = FindNavCellAtTier(Current.Point.Coord, Tier);
 
 		for (const FVoxelNavLink& Link : Cell->Links)
 		{
@@ -424,16 +769,16 @@ TArray<FVoxelPathPoint> AVoxelTerrainActor::FindPath(FIntVector StartCoord, FInt
 				continue;
 			}
 
-			const FVoxelNavCell* NextCell = FindNavCell(NextCoord);
+			const FVoxelNavCell* NextCell = FindNavCellAtTier(NextCoord, Tier);
 			if (!NextCell || NextCell->AllowHeight < Height)
 			{
-				continue; // 对方站不下这个体型的 AI
+				continue; // 这一档站不下这个身高的 AI
 			}
 
-			if (GetCoordOccupant(NextCoord))
+			if (IsFootprintBlocked(NextCoord, Width, IgnoreAgent))
 			{
-				// 站着别的 AI。占地是随时间变的，所以只在查询期判，绝不写进烘焙数据；
-				// 终点也走这条判定，所以「终点被人占了」会直接表现为找不到路，由调用方退到 4 邻
+				// footprint 里有别的 AI 占着的格（终点同理：「终点被人占了」表现为找不到路，由调用方退到邻格吸附）。
+				// 占地与预约都是随时间变的，只在查询期判，绝不写进烘焙数据
 				continue;
 			}
 
@@ -443,7 +788,7 @@ TArray<FVoxelPathPoint> AVoxelTerrainActor::FindPath(FIntVector StartCoord, FInt
 			{
 				continue;
 			}
-			// 只罚不奖：权重低于 1 也按 1 算，否则启发式“每步 >= 1”的下界就不成立了
+			// 只罚不奖：权重低于 1 也按 1 算，否则启发式“每步 >= 一个单位”的下界就不成立了
 			float StepCost = FMath::Max(1.f, Weight);
 
 			if (Link.ProxyClass)
@@ -456,7 +801,23 @@ TArray<FVoxelPathPoint> AVoxelTerrainActor::FindPath(FIntVector StartCoord, FInt
 				}
 				StepCost *= FMath::Max(1.f, ProxyCDO->Weight);
 			}
+			if (bScheduled)
+			{
+				// 时空模式换成秒计：与 CommitPathReservations 共用同一份 HopDurationSeconds 口径
+				StepCost = HopDurationSeconds(NextPoint, SecondsPerStep);
+			}
 			const float Tentative = CurrentG + StepCost;
+
+			if (bScheduled && IgnoreAgent)
+			{
+				// 预约冲突：预计到达时刻落在别人登记的窗口里（或对穿），这一跳按走不得处理。
+				// 展开期只能量到「到达后至少一步」的最短驻留；完整窗口的裁决在 Commit 时做
+				const FIntVector FromCoord = Current.Point.Coord;
+				if (IsCoordReservedAt(NextCoord, Tentative, Tentative + BaseSeconds, IgnoreAgent, &FromCoord))
+				{
+					continue;
+				}
+			}
 
 			if (const float* Existing = GScore.Find(NextPoint))
 			{
@@ -467,7 +828,7 @@ TArray<FVoxelPathPoint> AVoxelTerrainActor::FindPath(FIntVector StartCoord, FInt
 			}
 			GScore.Add(NextPoint, Tentative);
 			Parent.Add(NextPoint, Current.Point);
-			Open.Push({ Tentative + NavHeuristic(NextCoord, EndCoord), NextPoint });
+			Open.Push({ Tentative + NavHeuristic(NextCoord, EndCoord) * StepUnit, NextPoint });
 		}
 	}
 

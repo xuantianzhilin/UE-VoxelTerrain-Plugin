@@ -78,6 +78,8 @@ enum class EVoxelPathFollowingStatus : uint8
 	/** 暂停中：路径与进度都保留着，ResumeMove 接着走；不会广播结果 */
 	Paused		UMETA(DisplayName = "已暂停"),
 	WaitingLink	UMETA(DisplayName = "等连接代理放行"),
+	/** 让行中：下一格被别的 AI 占着，原地等它空出来；超时自动重寻路（见 bAutoRepath） */
+	Yielding	UMETA(DisplayName = "让行等待"),
 };
 
 /** 移动结束时给调用方的回执 */
@@ -105,17 +107,17 @@ struct FVoxelPathFollowingResultInfo
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FVoxelMoveFinishedSignature, const FVoxelPathFollowingResultInfo&, Result);
 
 /**
- * 让 Owner 沿「调用方算好的路径」逐格行走（不寻路、不依赖 NavMesh，也不驱动行为树）。
+ * 让 Owner 沿「调用方算好的路径」逐格行走（本组件不寻路、不依赖 NavMesh，也不驱动行为树）。
  *
- * 路径从哪来：调用方自己算（通常就是 AVoxelTerrainActor::FindPath），再交给 RequestMove。
- * 组件只负责走：不寻路、不判断终点合法性、也不替调用方换终点。
+ * 路径从哪来：调用方自己算（通常就是 AVoxelTerrainActor::FindPath / FindPathScheduled），再交给 RequestMove；
+ * 或者用 RequestMoveToGoal 一步到位（内部走 FindPathScheduled，并解锁「被挡时自动重寻路」）。
  *
  * 怎么走：平面跳（同层水平相邻，FVoxelPathPoint::LinkClass 为空）由本组件插值走过去；
  * 非平面跳（台阶 / 手动连接，LinkClass 非空）交给 UVoxelNavLinkProxy：把 Agent 交出去，
  * 等它调 ResumePathFollowing 放行后接着走剩下的路。
  *
  * 位移有两套驱动（EVoxelMoveDrive）：
- *   - DirectLocation：直接插值 SetActorLocation，落点精确到格心，不吃物理；
+ *   - DirectLocation：直接插值 SetActorLocation，落点精确到格心（宽体型是 footprint 中心），不吃物理；
  *   - NavMovement：Owner 上有 INavMovementInterface（CharacterMovement / NavMovementComponent）时
  *     下发速度/输入，由移动组件决定实际位移，到点按容差判定。
  * Auto（默认）就是「有移动组件就用它，没有就退回直接插值」。
@@ -124,14 +126,23 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FVoxelMoveFinishedSignature, const F
  *       改用 RequestPathMove 下发输入，否则那一套会把你请求的速度当成「没有输入」慢慢抹掉。
  *       CharacterMovement 不受影响（它每帧直接吃 RequestedVelocity）。
  *
+ * 群体避让（bClaimCells 打开时生效，两层）：
+ *   - 硬保证「先占后走」：每一跳之前必须先把目标格（宽体型是整块 footprint）从地形占地表上拿下来才迈步；
+ *     拿不到就原地进入 Yielding 等待，不穿人、不抢格。走到新格后才释放旧格 —— 行进中同时持有两块登记。
+ *     过连接前同样先占住目标格（这就是「用连接时占住连接」的落地形式：别人进不来，连接排队天然成立）。
+ *   - 软规划「时空预约」：RequestMove 收下路径后按本组件的 MoveSpeed 估出逐格到达时刻，把整条路径登记进
+ *     地形的预约表（原子提交，有冲突就不登记），别人的 FindPathScheduled 会自动绕开你的时间窗。
+ *     实际早到/晚到没关系 —— 正确性在硬保证层。
+ *   - 让行超时（MaxYieldTime）后自动重寻路（仅 RequestMoveToGoal 发起的移动；重寻预算 MaxRepathCount 次，
+ *     用完仍过不去按 Blocked 收尾）。
+ *
  * 约定：
  *   - 组件的活动范围是「一个 Owner 一个跟随组件」；
- *   - 不做路径重算、不做中途阻挡规避（回合制一次只有一个角色动），路径一旦收下就一路走完；
  *   - 走的过程中可以用 PauseMove / ResumeMove 暂停与继续：保留路径与进度，不广播结果、不重新寻路；
- *   - 只要 bClaimCells 开着，组件就会用地形的占地表：出发时预约终点、行进中维护自己占的那一格、
- *     过连接时占住那条连接，这样别人的 A* 会自动绕开角色。
- *     ⚠ 这条约定有顺序要求：要连着重发请求时先 StopMovement() 再算路径，否则上一个请求预约的终点
- *       还占在占地表里，A* 会把它当成别人占着。
+ *   - 纯手动流（自己 FindPath + RequestMove）保持「组件不寻路」的边界：被挡超时会按 Blocked 收尾，
+ *     重寻路与否由游戏层决定；要插件包办就用 RequestMoveToGoal。
+ *     ⚠ 手动重发请求的顺序要求仍然存在：先 StopMovement() 再 FindPath，
+ *       否则上一个请求预约的时间窗与下一格预占会让 A* 把自己当成别人。RequestMoveToGoal 无此坑。
  */
 UCLASS(ClassGroup = (Voxel), meta = (BlueprintSpawnableComponent))
 class VOXELTERRAIN_API UVoxelPathFollowingComponent : public UActorComponent
@@ -222,6 +233,28 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Navigation")
 	TObjectPtr<AVoxelTerrainActor> Terrain;
 
+	/** 体型：正方形 footprint 的边长（格数），1 = 单格角色。必须是地形烘过的体型档
+	 *  （AVoxelTerrainActor::AgentFootprintWidths），否则 RequestMove 会被拒；移动中途改它同样会被拒 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Navigation", meta = (ClampMin = "1", ClampMax = "8"))
+	int32 AgentWidth = 1;
+
+	/** 收下路径时把整条路径按时间窗登记进地形的预约表（别人的时空寻路会绕开你）。
+	 *  只在 bClaimCells 打开且 MoveSpeed > 0 时有意义（瞬移模式预测不了到达时刻） */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Navigation", meta = (EditCondition = "bClaimCells"))
+	bool bReservePath = true;
+
+	/** 让行等待的上限（秒）：下一格一直被占，超时自动重寻路（仅 RequestMoveToGoal 发起的移动）或按 Blocked 收尾；<=0 表示无限等 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Navigation", meta = (ClampMin = "0"))
+	float MaxYieldTime = 4.f;
+
+	/** 让行超时后自动从当前位置重寻路到目标（只对 RequestMoveToGoal 发起的移动生效） */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Navigation")
+	bool bAutoRepath = true;
+
+	/** 一次 RequestMoveToGoal 允许的重寻路次数（用完仍过不去就按 Blocked 收尾） */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Voxel|Navigation", meta = (ClampMin = "0", EditCondition = "bAutoRepath"))
+	int32 MaxRepathCount = 2;
+
 	/* ===================== 请求与状态 ===================== */
 
 	/**
@@ -240,8 +273,8 @@ public:
 	 *   TArray<FVoxelPathPoint> Path = Terrain->FindPath(Start, Goal, AgentHeight);
 	 *   Comp->RequestMove(Path);   // 空数组会被拒（InvalidPath）
 	 * @endcode
-	 * ⚠ 连续重发请求时先 StopMovement() 再算路径：上一个请求预约的终点还占在占地表里，
-	 *   FindPath 会把自己预约的格当成别人占着。
+	 * ⚠ 连续重发请求时先 StopMovement() 再算路径：上一个请求预占的下一格与登记的预约时间窗还在表里，
+	 *   先寻路会把自己当成别人（RequestMoveToGoal 与它的自动重寻路没有这个顺序坑）。
 	 *
 	 * 返回是否出发了。失败（InvalidPath / NoTerrain / Blocked）会立刻广播一次 OnMoveFinished，不会动 Actor。
 	 * 暂停中发新请求：旧请求照旧被顶掉（收到 Aborted），新请求直接开始走 —— 新请求不受暂停影响。
@@ -250,6 +283,14 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
 	bool RequestMove(TArray<FVoxelPathPoint> InPath);
+
+	/**
+	 * 一步到位的寻路+移动：内部用 FindPathScheduled（时空 A*，绕开别人的预约与对穿）从当前所在格
+	 * 寻路到 Goal 再 RequestMove。经这条入口的移动会记住目标格，被挡超时时自动重寻路（bAutoRepath）。
+	 * 找不到路（起终点站不住 / 被占被预约挡死 / 体型档没烘）返回 false，不广播。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation", meta = (Keywords = "move to goal 寻路 移动"))
+	bool RequestMoveToGoal(FIntVector Goal, int32 AgentHeight);
 
 	/** 中止当前移动（正在等的连接会被释放），结果码 Aborted */
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
@@ -289,6 +330,10 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
 	bool IsUsingLink() const { return Status == EVoxelPathFollowingStatus::WaitingLink; }
 
+	/** 是否正因下一格被别的 AI 占着而原地等待 */
+	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
+	bool IsYielding() const { return Status == EVoxelPathFollowingStatus::Yielding; }
+
 	/** 当前所处的格（按 Actor 位置反推）。没有地形 / 没有 Owner 时返回 (MAX_int32, MAX_int32, MAX_int32) */
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
 	FIntVector GetCurrentCoord() const;
@@ -312,10 +357,14 @@ public:
 	void ResumeFromLink();
 
 	/**
-	 * 把 Owner 精确放到某一格的「站位」上（格心 + GetCellOffset()）。给默认的连接代理复用它，
-	 * 免得代理直接把角色按到格心里、陷进地板（那不是它该站的高度）。
+	 * 把 Owner 精确放到某一格的「站位」上（格心 + 宽体型水平偏移 + GetCellOffset() 的竖直偏移）。
+	 * 给默认的连接代理复用它，免得代理直接把角色按到格心里、陷进地板（那不是它该站的高度）。
 	 */
 	void SnapToCell(const FIntVector& Coord);
+
+	/** 某格的站位（本组件口径下的世界坐标）。连接代理算飞行终点用，保证与逐格行走同一口径 */
+	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
+	FVector GetCellStandLocation(const FIntVector& Coord) const { return CellLocation(Coord); }
 
 	/** 移动结束时广播一次（进度不广播；失败也广播，调用方挂这一个回调就能处理所有分支） */
 	UPROPERTY(BlueprintAssignable, Category = "Voxel|Navigation")
@@ -387,8 +436,11 @@ private:
 	/** 卡住保护：距离没有实质改善就累计时间，超时按 Blocked 收尾 */
 	void UpdateStall(float DistanceToTarget, float DeltaTime);
 
-	/** 跨格时更新「自己占的那一格」（失败只告警，不动旧登记，免得删掉别人的记录） */
+	/** 跨格时更新「自己占的那一格」（footprint 版；失败只告警，不动旧登记，免得删掉别人的记录） */
 	void SyncClaimToCurrentCoord();
+
+	/** 到达预占格后的登记转移：新格落账为当前格，与旧格不同才释放旧格（先占后走的收尾半句） */
+	void TransferClaimTo(const FIntVector& Anchor);
 
 	/** 走到第 Index 个路径点时的收尾（DirectLocation 模式在这里精确吸附到格心） */
 	void OnReachedPathPoint(int32 Index);
@@ -401,8 +453,22 @@ private:
 
 	void ReleaseActiveLink();
 
-	/** 结束当前移动：释放连接与占地、停 Tick、广播结果。空闲状态下调用它就只是广播 */
-	void FinishMove(EVoxelPathFollowingResult Code);
+	/** 结束当前移动：释放连接与占地、清预约、停 Tick、可选广播结果。空闲状态下调用它就只是广播 */
+	void FinishMove(EVoxelPathFollowingResult Code, bool bBroadcast = true);
+
+	/** RequestMove / RequestMoveToGoal 的重寻路内部版：bBroadcastAborted 关掉「顶掉旧请求」的那次 Aborted 广播 */
+	bool RequestMoveInternal(TArray<FVoxelPathPoint> InPath, bool bBroadcastAborted);
+
+	/** 进入让行等待（下一格被占；同时清掉本帧的速度请求） */
+	void BeginYield();
+	/** 让行中推进一格时钟：能占了回 Moving；超时走重寻路/收尾。返回 true 表示本帧已离开让行态 */
+	bool AdvanceYield(float DeltaTime);
+	/** 让行超时的出路：自动重寻路（RequestMoveToGoal 的移动且还有预算），否则 Blocked 收尾 */
+	void TryAutoRepathOrFinish();
+	/** 实际使用的体型宽（夹在 [1,8]） */
+	int32 GetClampedAgentWidth() const { return FMath::Clamp(AgentWidth, 1, 8); }
+	/** 按当前速度口径的一格平步耗时（秒）；瞬移（MoveSpeed<=0）返回 0 表示预约不可用 */
+	float GetSecondsPerStep() const;
 
 	/** 移动组件模式下清掉最后一次速度请求（暂停与收尾共用；没有移动权限时不动它） */
 	void StopNavMovement();
@@ -420,11 +486,25 @@ private:
 
 	FVoxelPathFollowingResultInfo LastResult;
 
-	/** 当前登记在占地表里属于自己的一格 */
+	/** 当前登记在占地表里属于自己的一格（宽体型是它的 footprint anchor） */
 	FIntVector ClaimedCoord = FIntVector::ZeroValue;
 	bool bHasClaim = false;
-	/** 出发时预约下来的终点格 */
-	FIntVector ReservedGoal = FIntVector::ZeroValue;
+	/** 先占后走：已经占下、正在朝它移动的那一格（到达前与 ClaimedCoord 并存，杜绝中途空窗） */
+	FIntVector NextClaimedCoord = FIntVector::ZeroValue;
+	bool bHasNextClaim = false;
+
+	/** 让行计时（秒） */
+	float YieldTimer = 0.f;
+	/** 本次 RequestMoveToGoal 已经重寻路的次数 */
+	int32 RepathCount = 0;
+	/** 自动重寻路用的目标（仅 RequestMoveToGoal 入口写入；普通 RequestMove 会清掉） */
+	FIntVector MoveGoal = FIntVector::ZeroValue;
+	int32 MoveGoalHeight = 1;
+	bool bHasMoveGoal = false;
+	/** 本次移动是否真的把路径登记进了预约表（收尾时据此清理） */
+	bool bHasReservation = false;
+	/** 「瞬移模式不登记预约」只说一次 */
+	bool bLoggedNoReservation = false;
 
 	/** 正在使用的连接 */
 	UPROPERTY(Transient)

@@ -4,6 +4,7 @@
 #include "GameFramework/Actor.h"
 #include "VoxelChunk.h"
 #include "VoxelNavLinkProxy.h"
+#include "VoxelNavReservation.h"
 #include "VoxelTerrainActor.generated.h"
 
 class UVoxelGenerator;
@@ -170,25 +171,98 @@ public:
 	TSubclassOf<UVoxelNavLinkProxy> GetAutoNavLinkProxyClass() const { return AutoLinkProxy; }
 	const TArray<FVoxelNavLinkProxyData>& GetLinkProxyData() const { return LinkData; }
 
+	/*==================== 体型档（AI 横向占地）====================*/
+
+	/** 体型档表：每项是一个正方形 footprint 的边长（格数）。烘焙与查询用的档号是「归一化后」(升序去重、恒含 1、每项夹在 [1,8]) 的下标。
+	 *  改了它必须重烘（ConfigureAgentSizes 会立刻做）；上限 8 是为了让 footprint 的牵连范围不超过一层（Section 边长 16）。 */
+	UPROPERTY(EditAnywhere, Category = "Voxel|Navigation", meta = (ClampMin = "1", ClampMax = "8", ToolTip = "支持的 AI 体型档：每行的数字是正方形 footprint 的边长（格数）。1=旧式单格角色。档位越多烘焙越慢越占内存；改完要重烘（点“重烘导航”或调 ConfigureAgentSizes）。footprint 净空按覆盖列的 min 记，查询期直接过滤，不再展开。"))
+	TArray<int32> AgentFootprintWidths{ 1 };
+
+	/** 归一化后的体型档表（升序、去重、恒含 1，每项夹在 [1,8]）。烘焙与 ResolveNavTier 用的是同一份。 */
+	TArray<int32> GetNavFootprintWidths() const;
+	/** 宽 W 对应的档号；没配这一档返回 INDEX_NONE（调用方按「体型不支持」处理） */
+	int32 ResolveNavTier(int32 Width) const;
+	/** 最大档宽（≥1）。脏区横向牵连 = 它减 1 */
+	int32 GetMaxAgentFootprintWidth() const;
+	/** 运行期改体型档表：立刻全量重烘导航（footprint 是烘在 NavData 里的） */
+	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation", meta = (Keywords = "agent size footprint 体型"))
+	void ConfigureAgentSizes(const TArray<int32>& Widths);
+
+	/** footprint 以 anchor 为格、向 -X/-Y 覆盖 Width/2 格、向 +X/+Y 覆盖 (Width-1)-Width/2 格（奇数档 anchor 即中心格）。 */
+	static FIntVector FootprintOrigin(const FIntVector& Anchor, int32 Width);
+	/** anchor 格的格心 + 宽体型的水平半格偏移 = 整块 footprint 的中心（1 格体型就是格心） */
+	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
+	FVector FootprintCenterToWorld(FIntVector Anchor, int32 AgentWidth) const;
+	/** FootprintCenterToWorld 的逆运算：footprint 中心世界坐标 → anchor 格（「Actor 位置 ↔ anchor 格」保持一一对应） */
+	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation")
+	FIntVector WorldToFootprintAnchor(const FVector& WorldLocation, int32 AgentWidth) const;
+
+	/*==================== AI 占地（硬保证：一格同时只有一个 AI，footprint 整体占）====================*/
+
 	bool TryOccupyCoord(FIntVector Coord, AActor* Occupant);
 	void ReleaseCoord(const FIntVector& Coord, AActor* Occupant);
 	AActor* GetCoordOccupant(const FIntVector& Coord) const;
+	/** 宽体型版：footprint 覆盖的每一格都空闲（或已属于同一 Occupant）才整体登记，否则一格都不写 */
+	bool TryOccupyFootprint(FIntVector Anchor, int32 AgentWidth, AActor* Occupant);
+	void ReleaseFootprint(FIntVector Anchor, int32 AgentWidth, AActor* Occupant);
+	/** footprint 里是否有别人占着的格（IgnoreAgent 自己占的不算） */
+	bool IsFootprintBlocked(FIntVector Anchor, int32 AgentWidth, const AActor* IgnoreAgent = nullptr) const;
 
-	TArray<TPair<FIntVector, float>> FindFreeNearbyCoord(FIntVector Target, int32 AgentHeight, int32 Radius) const;
+	/** 吸附用：目标格附近哪些落脚点空着（含体型过滤与 footprint 占地判定），按到目标的切比雪夫距离分组返回 */
+	TArray<TPair<FIntVector, float>> FindFreeNearbyCoord(FIntVector Target, int32 AgentHeight, int32 Radius, int32 AgentWidth = 1) const;
 
-	/** 按全局体素坐标取导航节点；返回 nullptr 表示该格不是落脚格（不是地面、被挡住、没烘到或没有 Chunk）*/
-	const FVoxelNavCell* FindNavCell(const FIntVector& GlobalCoord) const;
+	/** 按全局体素坐标取导航节点；返回 nullptr 表示该格（对该体型档）不是落脚格（不是地面、被挡住、没烘到或没有 Chunk）*/
+	const FVoxelNavCell* FindNavCell(const FIntVector& GlobalCoord, int32 AgentWidth = 1) const;
 
 	/**
-	 * 限制：只适用于「占地 1 格」的 AI。AgentHeight 管的是落脚点自己那一列的竖直净空，横向完全没判，
+	 * 空间 A*：只躲「当前被占着的格」（硬占地表），不看时间预约。
+	 * AgentWidth 必须是已配置的体型档，否则返回空数组并告警；途经/终点格的 footprint 里有别人的占格也绕开。
+	 * 寻路结果按 footprint 中心走：路径点坐标是 anchor 格。
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation", meta = (Keywords = "astar path 寻路 路径 找路"))
-	TArray<FVoxelPathPoint> FindPath(FIntVector StartCoord, FIntVector EndCoord, int32 AgentHeight) const;
+	TArray<FVoxelPathPoint> FindPath(FIntVector StartCoord, FIntVector EndCoord, int32 AgentHeight, int32 AgentWidth = 1, const AActor* IgnoreAgent = nullptr) const;
+
+	/**
+	 * 时空 A*：在空间避让之外，再多看一层「预约表」——按预计到达时刻绕开别人登记在那一格时间窗里的路线，
+	 * 对向/交叉冲突在规划期就消解（规划期不安排原地等待；兜底的先占后走见 UVoxelPathFollowingComponent）。
+	 * SecondsPerStep：一格平步的基准秒数（调用方按自己的 MoveSpeed 算，<=0 按 1 步 1 秒退化）；
+	 * OutTravelTime：整条路径预计耗时（秒）。找不到路（含被预约挡死）返回空数组。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Voxel|Navigation", meta = (Keywords = "astar path schedule reservation 预约 寻路"))
+	TArray<FVoxelPathPoint> FindPathScheduled(FIntVector StartCoord, FIntVector EndCoord, int32 AgentHeight, int32 AgentWidth,
+		const AActor* Agent, float SecondsPerStep, float StartDelay, float& OutTravelTime) const;
+
+	/*==================== 时空预约（群体避障的软规划层）====================*/
+
+	/** 把一条路径按时间窗登记进预约表（footprint 展开到每一格）。整条先做冲突检测，全空才写入（原子提交）；
+	 *  失败（有冲突/路径非法）返回 false 且不写任何东西。IgnoreAgent 默认排除 Agent 自己的旧预约。 */
+	bool CommitPathReservations(AActor* Agent, const TArray<FVoxelPathPoint>& Path, int32 AgentWidth,
+		float SecondsPerStep, float NowSeconds, float& OutTravelTime);
+	/** 释放某 Agent 的全部预约（移动结束/中止/销毁时调；弱指针失效的条目也会被读时清理兜底） */
+	void RemoveReservationsFor(const AActor* Agent);
+	/** [tEnter,tExit] 窗口里 Coord 是否被别人预约占用；给了 From 就连「对穿」（别人此刻正从 Coord 走到 From）一起判 */
+	bool IsCoordReservedAt(const FIntVector& Coord, float tEnter, float tExit, const AActor* IgnoreAgent,
+		const FIntVector* SwapFrom = nullptr) const;
 
 private:
 
 	/*手动加/删连接后，把两端所在的 Section 立刻重烘一遍（连接是烘在 NavData 里的）*/
 	void RebuildLinksAround(const FVoxelNavLinkProxyData& ProxyData);
+
+	/*按档号取节点（档号是归一化体型表的下标；越界返回 nullptr）*/
+	const FVoxelNavCell* FindNavCellAtTier(const FIntVector& GlobalCoord, int32 Tier) const;
+
+	/*FindPath / FindPathScheduled 的共同实现。bScheduled 为 true 时代价即秒：G 值就是预计到达时刻，
+	  展开时额外查预约表（绕开别人登记的格与对穿），OutTravelTime 带回全程耗时*/
+	TArray<FVoxelPathPoint> FindPathInternal(FIntVector StartCoord, FIntVector EndCoord, int32 AgentHeight, int32 AgentWidth,
+		const AActor* IgnoreAgent, bool bScheduled, float SecondsPerStep, float StartDelay, float& OutTravelTime) const;
+
+	/*一跳的预计耗时（秒）：平面跳 = BaseSecondsPerStep × 区域权重；代理跳 = max(基准, ExpectedMoveDuration × 代理权重 × 区域权重)。
+	  FindPathScheduled 的时间推进与 CommitPathReservations 登记窗口共用这一份口径。*/
+	float HopDurationSeconds(const FVoxelPathPoint& ToPoint, float BaseSecondsPerStep) const;
+
+	/*丢掉窗口已过（含宽限）与 Agent 已失效的预约条目；Tick 定期与查询读时都会做*/
+	void PruneExpiredReservations(float NowSeconds);
 
 	/*====================== 地形射线检测 ============================*/
 
@@ -213,7 +287,7 @@ protected:
 	TSoftClassPtr<UVoxelGenerator> VoxelGenerator;
 	UPROPERTY(EditAnywhere, Category = "Voxel|Generator")
 	bool bRunGeneratorOnBeginPlay = false;
-	UPROPERTY(EditAnywhere, Category = "Voxel|Navigation", meta = (ClampMin = "1", ClampMax = "15", ToolTip = "净空（AllowHeight）统计的格数上限：落脚格向上数这么多格还没被挡就按“至少这么高”封顶。必须 >= 最重的 AI 体型，且不能超过一层的 16 格（否则局部重建要往下牵连的层数就不止一层）。只统计竖直方向，不判 AI 的横向占地：导航图始终按“一格宽”的体型烘焙。"))
+	UPROPERTY(EditAnywhere, Category = "Voxel|Navigation", meta = (ClampMin = "1", ClampMax = "15", ToolTip = "净空（AllowHeight）统计的格数上限：落脚格向上数这么多格还没被挡就按“至少这么高”封顶。必须 >= 最重的 AI 身高，且不能超过一层的 16 格（否则局部重建要往下牵连的层数就不止一层）。宽体型的横向占地按体型档（AgentFootprintWidths）在烘焙期分档记录，查询期按 AgentHeight 过滤分档净空。"))
 	int32 MaxAllowHeight = 4;
 	UPROPERTY(EditAnywhere, Category = "Voxel|Navigation")
 	bool bAutoSpawNavLink = false;
@@ -257,6 +331,10 @@ private:
  *  自动连接又可能把连接拉到 NavLinkMaxHeightDiff 格高 —— 取二者较大，脏区判定用它 */
 	int32 GetMaxImpactHeight() const;
 
+	/** 改一体素时，导航在水平方向能牵连到多远：宽档 footprint 最远读到旁边 MaxW-1 格，脏区横向判定用它
+	 *  （体型档上限 8 < Section 边长 16，牵连不会越过相邻 Section；1×1 档时为 0，与旧行为一致） */
+	int32 GetMaxImpactPad() const;
+
 	UPROPERTY()
 	TMap<FIntVector2, FVoxelChunk> Chunks;
 	TMap<FIntVector2, TArray<FIntVector>> DirtySections;
@@ -270,4 +348,7 @@ private:
 	TArray<FVoxelNavLinkProxyData> LinkData;
 
 	mutable TMap<FIntVector, TWeakObjectPtr<AActor>> CoordRecords;
+
+	/* 时空预约表（群体避障的软规划层）：一格 -> 若干时间窗。纯运行期数据，派生自移动中的 AI，不入档不序列化 */
+	TMap<FIntVector, TArray<FNavReservation>> Reservations;
 };

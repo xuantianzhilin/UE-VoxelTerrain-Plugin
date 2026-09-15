@@ -70,18 +70,19 @@ struct FVoxelNavLink
 };
 
 /**
- * 一个落脚格：本格自己的净空 + 到水平 4 邻的连接。
+ * 一个落脚格（属于某一个「体型档」）：footprint 净空 + 到水平 4 邻的连接。
  *
- * 限制：整张导航图是按「AI 占地 1 格」烘的。AllowHeight 只数本格这一列，横向相邻的格（含 90° 拐角
- * 会被身体扫到的那格）有没有被挡完全没查，所以占地 > 1 格的 AI 在这里会看到假通路：
- * 1 格宽的隘口、旁边就是墙的落脚格、拐角处的对角格，全都算走得通。
- * 一格 = VoxelSize（默认 100，即 1 米），胶囊半径 40 上下的人形 AI 占 1 格是准确的；
- * 要做更宽的体型，必须在烘焙里按半径分档记录净空（见 AVoxelTerrainActor::FindPath 的说明），查询期补不出来。
+ * 导航图按体型分档烘焙（见 AVoxelTerrainActor::GetNavFootprintWidths）：档 W 的节点是
+ * 「W×W 的方形 footprint 能以本格为 anchor 完整站下」的落脚位。footprint 覆盖规则见
+ * AVoxelTerrainActor::FootprintOrigin：anchor 固定在格上，「Actor 位置 ↔ anchor 格」一一对应。
+ * 4 邻移动扫过的位置并集恰为两端 footprint（格子图只做轴向迈步，没有斜步，拐角天然安全），
+ * 所以「两端都是本档节点」就是平面连接对本档体型成立的充要判据，不需要别的横向检查。
  */
 struct FVoxelNavCell
 {
-	/** 本格能通过的最高 AI（体素单位）：从本格起向上数连续的净空格数，只看本格这一列，与旧寻路的 AgentHeight 同义。
-	 *  数到 AVoxelTerrainActor::GetMaxAllowHeight() 格就封顶，取到该值只表示“至少这么高” */
+	/** 本格能通过的最高 AI（体素单位）。档 0（1×1）是从本格起向上数连续的净空格数、只看本格这一列；
+	 *  宽档取 footprint 覆盖的各列净空的 min（封顶单调：min-of-cap == cap-of-min，查询期仍按 AgentHeight 过滤）。
+	 *  数到 AVoxelTerrainActor::GetMaxAllowHeight() 格封顶，取到该值只表示“至少这么高”；0 = 该档站不下（不会有条目） */
 	int32 AllowHeight = 0;
 	/** 走得通的邻格：平面连接只含同层水平 4 邻；高差不同或不相邻的得靠代理连接（见 FVoxelNavLink） */
 	TArray<FVoxelNavLink> Links;
@@ -110,17 +111,24 @@ public:
 	TArray<FVoxelMeshData> BuildMeshData(const AVoxelTerrainActor* Terrain) const;
 
 	/**
-	 * 烘焙本 Section 的导航数据到 NavData（每次调用整体重建本 Section 的部分）。
-	 * 节点是"落脚格"：自身为空、下方有支撑（体素或被静态网格体等外部阻碍占据的格都算支撑）。
+	 * 烘焙本 Section 的导航数据到 NavDataByTier（每次调用按地形的体型档表整体重建本 Section 的部分）。
+	 * 节点是"落脚格"：档 0 要求自身为空、下方有支撑（体素或被静态网格体等外部阻碍占据的格都算支撑）；
+	 * 宽档（W>1）要求以本格为 anchor 的 W×W footprint 覆盖的每一格都满足档 0 的落脚条件，
+	 * AllowHeight 取覆盖列净空的 min（烘焙期滑窗算好，查询期不再做 footprint 展开）。
 	 * 连接规则：平面连接只连同层水平 4 邻；高差在 NavLinkMaxHeightDiff 内的相邻格由 bAutoSpawNavLink 自动
 	 * 挂上 NavLinkProxyClass；更远或跨层的连接由 AddLinkProxy 手动挂。骨骼网格体不参与烘焙。
-	 * 烘出来的图服务的是「占地 1 格」的 AI：只判落脚点自身这一列的空位与支撑，不判身体横向占掉的其它格（见 FVoxelNavCell）。
-	 * Key = 落脚格在本 Section 内的局部坐标，Value 见 FVoxelNavCell；链接目标可能落在相邻 Section。
-	 * 注意：外扩一圈只为判定边界格与邻格，本函数不会写入相邻 Section 的数据（那边烘焙自己的）。
+	 * 烘出来的图按档分表：NavDataByTier[0] 恒为 1×1 档（与旧数据逐格一致），索引 i>0 对应
+	 * AVoxelTerrainActor::GetNavFootprintWidths()[i]。链接目标可能落在相邻 Section。
+	 * 注意：外扩一圈只为判定边界格与邻格（宽档按最大 footprint 放宽），本函数不会写入相邻 Section 的数据（那边烘焙自己的）。
+	 * Key = 落脚格在本 Section 内的局部坐标，Value 见 FVoxelNavCell。
 	 */
 	void BuildNavData(const AVoxelTerrainActor* Terrain);
-	void ClearNavData() { NavData.Reset(); }
-	const TMap<FIntVector, FVoxelNavCell>& GetNavData() const { return NavData; }
+	void ClearNavData() { NavDataByTier.Reset(); }
+	/** 档 0（1×1）的导航数据 */
+	const TMap<FIntVector, FVoxelNavCell>& GetNavData() const { return GetNavTierData(0); }
+	/** 指定体型档的导航数据；档不存在返回空表 */
+	const TMap<FIntVector, FVoxelNavCell>& GetNavTierData(int32 Tier) const;
+	int32 GetNavTierCount() const { return NavDataByTier.Num(); }
 
 private:
 
@@ -143,9 +151,10 @@ private:
 	UPROPERTY()
 	TArray<uint32> PackedData;		// 位打包数据
 
-	/* 导航数据：Key = 本 Section 内的落脚格局部坐标，Value = 该格的净空与到水平 4 邻的连接。
+	/* 导航数据：按体型档分表（索引即档号，见 FVoxelNavCell 注释），每档一张
+	   「本 Section 内落脚格局部坐标 -> FVoxelNavCell」的表。
 	   只由 BuildNavData 生成（未烘焙时为空），是派生数据，不参与序列化 */
-	TMap<FIntVector, FVoxelNavCell> NavData;
+	TArray<TMap<FIntVector, FVoxelNavCell>> NavDataByTier;
 };
 
 USTRUCT()

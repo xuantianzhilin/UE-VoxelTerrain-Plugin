@@ -1,18 +1,22 @@
 // 路径跟随：把「调用方算好的路径」变成逐帧位移。
 //
 // 职责边界：
-//   - 组件不寻路：路径由调用方算好传进来（通常就是 AVoxelTerrainActor::FindPath 的结果）。
-//   - 组件只负责「走」：终点合不合法、要不要换个终点，都是调用方的事。会拒收的输入只有两种 ——
-//     空路径，以及「路径起点与 Agent 当前所在的格对不上」（起点对不上时直线走向 path[0] 可能切墙）。
+//   - 常规入口不寻路：路径由调用方算好传进来（通常就是 AVoxelTerrainActor::FindPath 的结果）。
+//     RequestMoveToGoal 是便利入口：内部用 FindPathScheduled 算路，并为「被挡自动重寻路」记住目标。
+//   - 组件只负责「走」：终点合不合法、要不要换个终点，都是调用方的事。会拒收的输入只有三种 ——
+//     空路径、体型档没烘、以及「路径起点与 Agent 当前所在的格对不上」（起点对不上时直线走向 path[0] 可能切墙）。
 //   - 平面跳（同层水平 4 邻，LinkClass 为空）由本组件插值走过去：烘焙保证了这种跳一定同层相邻，
 //     所以直线插值不会穿墙。
 //   - 非平面跳（台阶 / 手动连接，LinkClass 非空）必须由 UVoxelNavLinkProxy 驱动：占住连接、把
 //     Agent 交出去，等它调 ResumePathFollowing 放行后接着走剩下的路。
 //     同步放行的代理（默认实现就是）在 StartLinkHop 里就地收尾，异步的（跳跃弧线/爬梯动画）
 //     靠 ResumeFromLink 置位、下一帧继续，两条路都不产生递归。
+//   - 群体避让两层：迈步前先把下一格整块 footprint 从占地表拿下（先占后走，拿不到就地 Yielding 等待；
+//     到达新格后才释放旧格，杜绝中途空窗与对穿）；收下路径后再按时间窗把整条路登记进地形预约表
+//     （软规划层，别人的 FindPathScheduled 会绕开我们）。收尾/中止统一释放占地与预约。
 //
 // 位移有两套驱动（EVoxelMoveDrive），公式一样：速度取 min(MoveSpeed, 剩余距离/dt)，
-// 所以天然不过冲、恰好收敛到格心，区别只在下发方式（SetActorLocation vs 移动组件）。
+// 所以天然不过冲、恰好收敛到站位（格心 / 宽体型是 footprint 中心），区别只在下发方式（SetActorLocation vs 移动组件）。
 
 #include "VoxelPathFollowingComponent.h"
 
@@ -53,17 +57,27 @@ void UVoxelPathFollowingComponent::BeginPlay()
 
 void UVoxelPathFollowingComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-	// 静默收尾：连接与占地登记都要还回去，但不广播 —— 销毁流程里回调游戏代码容易踩到半死的对象
+	// 静默收尾：连接、占地登记与预约都要还回去，但不广播 —— 销毁流程里回调游戏代码容易踩到半死的对象
 	ReleaseActiveLink();
 
 	if (bClaimCells && IsValid(Terrain))
 	{
 		if (bHasClaim)
 		{
-			Terrain->ReleaseCoord(ClaimedCoord, GetOwner());
+			Terrain->ReleaseFootprint(ClaimedCoord, GetClampedAgentWidth(), GetOwner());
+		}
+		if (bHasNextClaim)
+		{
+			Terrain->ReleaseFootprint(NextClaimedCoord, GetClampedAgentWidth(), GetOwner());
 		}
 	}
+	if (IsValid(Terrain))
+	{
+		Terrain->RemoveReservationsFor(GetOwner());
+	}
 	bHasClaim = false;
+	bHasNextClaim = false;
+	bHasReservation = false;
 	Status = EVoxelPathFollowingStatus::Idle;
 	Path.Reset();
 
@@ -144,7 +158,8 @@ void UVoxelPathFollowingComponent::ResolveDrive()
 FVector UVoxelPathFollowingComponent::CellLocation(const FIntVector& Coord) const
 {
 	const AVoxelTerrainActor* Found = FindTerrain();
-	const FVector Center = Found ? Found->CoordToWorldLocation(Coord) : FVector(Coord);
+	// 宽体型的「站位」是整块 footprint 的中心（奇数档=格心，偶数档在相邻四格的交界上），不是 anchor 格心
+	const FVector Center = Found ? Found->FootprintCenterToWorld(Coord, GetClampedAgentWidth()) : FVector(Coord);
 	return Center + GetCellOffset();
 }
 
@@ -235,9 +250,9 @@ FIntVector UVoxelPathFollowingComponent::GetCurrentCoord() const
 		return InvalidCoord();
 	}
 
-	// 减掉偏移再反推：偏移是「角色原点相对格心」的，不能让它把坐标算到隔壁格。
-	// 只减 Z：水平分量被忽略（见 GetCellOffset），否则「Actor 位置 ↔ 格坐标」就不再一一对应
-	return Found->WorldLocationToCoord(Owner->GetActorLocation() - GetCellOffset());
+	// 减掉竖直偏移再按体型口径反推 anchor：偏移是「角色原点相对站位」的，不能让它把坐标算到隔壁格。
+	// 水平方向本来就必须落在站位（footprint 中心）上，宽体型的半格口径由地形统一换算（WorldToFootprintAnchor）
+	return Found->WorldToFootprintAnchor(Owner->GetActorLocation() - GetCellOffset(), GetClampedAgentWidth());
 }
 
 float UVoxelPathFollowingComponent::GetVoxelExtent() const
@@ -321,9 +336,10 @@ void UVoxelPathFollowingComponent::FaceDirection(const FVector& Direction, float
 
 void UVoxelPathFollowingComponent::UpdateTickState()
 {
-	// 暂停 / 空闲都不用推进；等连接放行时反而**必须**继续 Tick —— 要靠它轮询代理的放行与超时
+	// 空闲不用推进；等连接放行与让行等待反而**必须**继续 Tick —— 要靠它轮询代理的放行 / 别人腾出的格子
 	const bool bNeedsAdvance = Status == EVoxelPathFollowingStatus::Moving
-		|| Status == EVoxelPathFollowingStatus::WaitingLink;
+		|| Status == EVoxelPathFollowingStatus::WaitingLink
+		|| Status == EVoxelPathFollowingStatus::Yielding;
 	const bool bShouldTick = bTickWhileMoving && bNeedsAdvance;
 	if (IsRegistered())
 	{
@@ -345,7 +361,53 @@ void UVoxelPathFollowingComponent::StopNavMovement()
 
 /* ===================== 请求 ===================== */
 
+float UVoxelPathFollowingComponent::GetSecondsPerStep() const
+{
+	if (MoveSpeed <= 0.f)
+	{
+		return 0.f;		// 瞬移模式：「预计到达时刻」没有意义，预约不可用
+	}
+	return GetVoxelExtent() / MoveSpeed;
+}
+
+bool UVoxelPathFollowingComponent::RequestMoveToGoal(FIntVector Goal, int32 AgentHeight)
+{
+	AActor* Owner = GetOwner();
+	AVoxelTerrainActor* FoundTerrain = ResolveTerrain();
+	if (!Owner || !FoundTerrain)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[Voxel] %s RequestMoveToGoal 找不到体素地形，请求未发出"), *GetNameSafe(Owner));
+		return false;
+	}
+
+	float Travel = 0.f;
+	const float SecondsPerStep = FMath::Max(GetSecondsPerStep(), 0.01f);		// 瞬移时退化为 1 秒/步：时刻估计粗糙但路线规划仍有效
+	TArray<FVoxelPathPoint> NewPath = FoundTerrain->FindPathScheduled(
+		GetCurrentCoord(), Goal, AgentHeight, GetClampedAgentWidth(), Owner, SecondsPerStep, 0.f, Travel);
+	if (NewPath.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[Voxel] %s 从 (%d,%d,%d) 到目标 (%d,%d,%d) 找不到路（站不住 / 被占 / 被预约挡死），请求未发出"),
+			*GetNameSafe(Owner), GetCurrentCoord().X, GetCurrentCoord().Y, GetCurrentCoord().Z, Goal.X, Goal.Y, Goal.Z);
+		return false;
+	}
+
+	// 记住目标与身高：这条入口的移动才有「被挡自动重寻路」的资格
+	bHasMoveGoal = true;
+	MoveGoal = Goal;
+	MoveGoalHeight = FMath::Max(AgentHeight, 1);
+	RepathCount = 0;
+	return RequestMoveInternal(MoveTemp(NewPath), true);
+}
+
 bool UVoxelPathFollowingComponent::RequestMove(TArray<FVoxelPathPoint> InPath)
+{
+	// 外部自算路径的请求：组件只负责走，「被挡自动重寻路」的目标格入口随之清除
+	bHasMoveGoal = false;
+	RepathCount = 0;
+	return RequestMoveInternal(MoveTemp(InPath), true);
+}
+
+bool UVoxelPathFollowingComponent::RequestMoveInternal(TArray<FVoxelPathPoint> InPath, bool bBroadcastAborted)
 {
 	if (bSwitchingRequest)
 	{
@@ -357,11 +419,12 @@ bool UVoxelPathFollowingComponent::RequestMove(TArray<FVoxelPathPoint> InPath)
 	AActor* Owner = GetOwner();
 	AVoxelTerrainActor* FoundTerrain = ResolveTerrain();
 
-	// 顶掉旧请求：先把它收尾（释放连接与占地登记），再收下新的路径
+	// 顶掉旧请求：先把它收尾（释放连接、占地与预约登记），再收下新的路径。
+	// 自动重寻路走内部版时不广播这次 Aborted（那是同一次移动换路，不是游戏取消了我们）
 	if (Status != EVoxelPathFollowingStatus::Idle)
 	{
 		bSwitchingRequest = true;
-		FinishMove(EVoxelPathFollowingResult::Aborted);
+		FinishMove(EVoxelPathFollowingResult::Aborted, bBroadcastAborted);
 		bSwitchingRequest = false;
 	}
 
@@ -372,6 +435,7 @@ bool UVoxelPathFollowingComponent::RequestMove(TArray<FVoxelPathPoint> InPath)
 	PathIndex = (Path.Num() > 1) ? 1 : 0;
 	StallTimer = 0.f;
 	StallBestDist = TNumericLimits<float>::Max();
+	YieldTimer = 0.f;
 	LastResult = FVoxelPathFollowingResultInfo{};
 	LastResult.GoalCoord = Path.IsEmpty() ? FIntVector::ZeroValue : Path.Last().Coord;
 
@@ -394,6 +458,16 @@ bool UVoxelPathFollowingComponent::RequestMove(TArray<FVoxelPathPoint> InPath)
 	// 先定下驱动，后面算「起点格/站位高度」要用它（自动竖直偏移依赖移动组件的碰撞柱体）
 	ResolveDrive();
 	LogCellOffsetOnce();
+
+	// 体型必须是地形烘过的档：占地口径、站位偏移与寻路过滤都挂在档位上，没烘的体型一格都不能走
+	if (FoundTerrain->ResolveNavTier(GetClampedAgentWidth()) == INDEX_NONE)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[Voxel] %s 体型 %d 格不是地形烘过的档（AgentFootprintWidths 没配它），移动取消"),
+			*GetNameSafe(Owner), GetClampedAgentWidth());
+		Path.Reset();
+		FinishMove(EVoxelPathFollowingResult::InvalidPath);
+		return false;
+	}
 
 	// 起点必须是 Agent 当前所在的格：对不上就拒绝 —— 直线走向远端 path[0] 可能切过墙体。
 	// 终点合不合法、要不要换终点，一概是调用方的事，这里不判。
@@ -452,16 +526,42 @@ bool UVoxelPathFollowingComponent::RequestMove(TArray<FVoxelPathPoint> InPath)
 			SuspiciousHops, FirstSuspicious.X, FirstSuspicious.Y, FirstSuspicious.Z);
 	}
 
-	// 占地：先把自己脚下这格登记好，再预约终点（终点已经在自己手上就不用重复预约）
+	// 占地：先把脚下这格整块 footprint 登记好；「下一格」的预占在每次迈步前才做（见 AdvanceFollowing）
 	if (bClaimCells)
 	{
 		SyncClaimToCurrentCoord();
 	}
 
+	// 预约（软规划层）：整条路径按时间窗原子提交。有冲突就放弃本次登记，
+	// 群体避让退回「硬占地 + 让行等待」，不影响我们自己走
+	bHasReservation = false;
+	if (bClaimCells && bReservePath && Path.Num() > 1)
+	{
+		const float SecondsPerStep = GetSecondsPerStep();
+		if (SecondsPerStep > 0.f)
+		{
+			float Travel = 0.f;
+			const UWorld* World = GetWorld();
+			bHasReservation = FoundTerrain->CommitPathReservations(Owner, Path, GetClampedAgentWidth(),
+				SecondsPerStep, World ? World->GetTimeSeconds() : 0.f, Travel);
+			if (bLogNavigation)
+			{
+				UE_LOG(LogTemp, Log, TEXT("[Voxel] %s 预约登记%s（预计全程 %.2fs）"), *GetNameSafe(Owner),
+					bHasReservation ? TEXT("成功") : TEXT("有冲突，退回逐格硬避让"), Travel);
+			}
+		}
+		else if (!bLoggedNoReservation)
+		{
+			bLoggedNoReservation = true;
+			UE_LOG(LogTemp, Log, TEXT("[Voxel] %s MoveSpeed<=0（瞬移），无法预测到达时刻，跳过预约登记；群体避让退回逐格硬占地"), *GetNameSafe(Owner));
+		}
+	}
+
 	if (bLogNavigation)
 	{
-		UE_LOG(LogTemp, Log, TEXT("[Voxel] %s RequestMove：起点格 %s 终点格 %s 点数 %d 从第 %d 个点开始 驱动 %s 速度 %.0f 站位偏移 %s Actor %s Terrain %s"),
+		UE_LOG(LogTemp, Log, TEXT("[Voxel] %s RequestMove：起点格 %s 终点格 %s 点数 %d 从第 %d 个点开始 体型 %d 格 预约 %s 驱动 %s 速度 %.0f 站位偏移 %s Actor %s Terrain %s"),
 			*GetNameSafe(Owner), *Path[0].Coord.ToString(), *LastResult.GoalCoord.ToString(), Path.Num(), PathIndex + 1,
+			GetClampedAgentWidth(), bHasReservation ? TEXT("已登记") : TEXT("未登记"),
 			GetActiveDrive() == EVoxelMoveDrive::NavMovement ? TEXT("移动组件") : TEXT("直接插值"),
 			MoveSpeed, *GetCellOffset().ToCompactString(), *Owner->GetActorLocation().ToCompactString(),
 			*GetNameSafe(FoundTerrain));
@@ -495,12 +595,12 @@ bool UVoxelPathFollowingComponent::PauseMove()
 			*GetNameSafe(GetOwner()));
 		return false;
 	}
-	if (Status != EVoxelPathFollowingStatus::Moving)
+	if (Status != EVoxelPathFollowingStatus::Moving && Status != EVoxelPathFollowingStatus::Yielding)
 	{
 		return false;		// 空闲，没什么可暂停的
 	}
 
-	// 路径、游标、占地登记一律保留：暂停不是结束，不广播结果
+	// 路径、游标、占地登记一律保留：暂停不是结束，不广播结果。让行中暂停同样合法（人就停在格心上）
 	Status = EVoxelPathFollowingStatus::Paused;
 	UpdateTickState();
 	StopNavMovement();		// 不清掉速度请求的话，移动组件会带着暂停前那一下的速度继续滑出去
@@ -529,6 +629,15 @@ void UVoxelPathFollowingComponent::AdvanceFollowing(float DeltaTime)
 	if (Status == EVoxelPathFollowingStatus::Idle || Status == EVoxelPathFollowingStatus::Paused || DeltaTime <= 0.f)
 	{
 		return;
+	}
+
+	// 让行等待：原地不动，每帧重试拿下下一格；超时走重寻路/收尾
+	if (Status == EVoxelPathFollowingStatus::Yielding)
+	{
+		if (!AdvanceYield(DeltaTime))
+		{
+			return;
+		}
 	}
 
 	AActor* Owner = GetOwner();
@@ -561,7 +670,7 @@ void UVoxelPathFollowingComponent::AdvanceFollowing(float DeltaTime)
 		}
 	}
 
-	// 本帧最多把整条路径走完（MoveSpeed<=0 时就是逐格瞬移）；遇到连接走一段就交接返回
+	// 本帧最多把整条路径走完（MoveSpeed<=0 时就是逐格瞬移）；让行/遇到连接各走一段就交接返回
 	for (int32 Guard = 0; Guard <= Path.Num() && Status == EVoxelPathFollowingStatus::Moving; ++Guard)
 	{
 		if (!Path.IsValidIndex(PathIndex))
@@ -570,22 +679,36 @@ void UVoxelPathFollowingComponent::AdvanceFollowing(float DeltaTime)
 			return;
 		}
 
-		SyncClaimToCurrentCoord();
+		const FIntVector NextAnchor = Path[PathIndex].Coord;
 
-		const FVector Target = CellLocation(Path[PathIndex].Coord);
-		const FVector Current = Owner->GetActorLocation();
-		const float Dist = static_cast<float>(FVector::Dist(Target, Current));
+		// 先占后走：下一格整块 footprint 没拿到之前，一步都不迈（平面跳与连接交接共用这道闸口）。
+		// 拿不到就地让行 —— 两人对穿被天然拦在格子层面，谁也没抢到谁就等
+		if (bClaimCells && !(bHasNextClaim && NextClaimedCoord == NextAnchor))
+		{
+			if (!FoundTerrain->TryOccupyFootprint(NextAnchor, GetClampedAgentWidth(), Owner))
+			{
+				BeginYield();
+				return;
+			}
+			NextClaimedCoord = NextAnchor;
+			bHasNextClaim = true;
+		}
 
-		// 非平面跳：必须由代理把 Agent 挪到目标格（此处一定已经站在这一跳的起点格上）
+		// 非平面跳：目标格已占下，把 Agent 交给代理（此处一定已经站在这一跳的起点格上）
 		if (PathIndex > 0 && Path[PathIndex].LinkClass)
 		{
 			StartLinkHop();
 			return;
 		}
 
+		const FVector Target = CellLocation(NextAnchor);
+		const FVector Current = Owner->GetActorLocation();
+		const float Dist = static_cast<float>(FVector::Dist(Target, Current));
+
 		if (HasReachedPathPoint(PathIndex, Current, Target, Dist))
 		{
 			OnReachedPathPoint(PathIndex);
+			TransferClaimTo(NextAnchor);
 			++PathIndex;
 			if (PathIndex >= Path.Num())
 			{
@@ -601,6 +724,166 @@ void UVoxelPathFollowingComponent::AdvanceFollowing(float DeltaTime)
 		StepTowardTarget(Target, DeltaTime);
 		return;
 	}
+}
+
+/* ===================== 占地与让行 ===================== */
+
+void UVoxelPathFollowingComponent::SyncClaimToCurrentCoord()
+{
+	if (!bClaimCells || !IsValid(Terrain))
+	{
+		return;
+	}
+
+	const FIntVector Current = GetCurrentCoord();
+	if (bHasClaim && Current == ClaimedCoord)
+	{
+		return;
+	}
+
+	if (Terrain->TryOccupyFootprint(Current, GetClampedAgentWidth(), GetOwner()))
+	{
+		if (bHasClaim && ClaimedCoord != Current)
+		{
+			Terrain->ReleaseFootprint(ClaimedCoord, GetClampedAgentWidth(), GetOwner());
+		}
+		ClaimedCoord = Current;
+		bHasClaim = true;
+	}
+	else
+	{
+		// 出生点就被人占着之类的极端情况。这里**不动**旧登记，免得把别人的记录删掉
+		UE_LOG(LogTemp, Warning, TEXT("[Voxel] (%d,%d,%d) 一带已被别的 Agent 占着，本次占地登记跳过"), Current.X, Current.Y, Current.Z);
+	}
+}
+
+void UVoxelPathFollowingComponent::TransferClaimTo(const FIntVector& Anchor)
+{
+	if (!bClaimCells || !IsValid(Terrain))
+	{
+		return;
+	}
+
+	// 新格早在迈步前就占着了（先占后走的「走」这一步只落登记口径）；释放旧格放在换登记之后，杜绝空窗。
+	// 新旧同格（单点路径原地对齐）不释放，免得把自己的登记删了
+	const FIntVector Old = ClaimedCoord;
+	const bool bHadOldClaim = bHasClaim;
+	ClaimedCoord = Anchor;
+	bHasClaim = true;
+	bHasNextClaim = false;
+	if (bHadOldClaim && Old != Anchor)
+	{
+		Terrain->ReleaseFootprint(Old, GetClampedAgentWidth(), GetOwner());
+	}
+}
+
+void UVoxelPathFollowingComponent::BeginYield()
+{
+	Status = EVoxelPathFollowingStatus::Yielding;
+	YieldTimer = 0.f;
+	StopNavMovement();		// 等待中把最后一次速度请求清零，免得角色顶着一个没人受理的请求滑进人堆里
+
+	if (bLogNavigation && IsValid(Terrain) && Path.IsValidIndex(PathIndex))
+	{
+		FString Holder = TEXT("?");
+		const FIntVector Origin = AVoxelTerrainActor::FootprintOrigin(Path[PathIndex].Coord, GetClampedAgentWidth());
+		for (int32 y = 0; y < GetClampedAgentWidth() && Holder == TEXT("?"); ++y)
+		{
+			for (int32 x = 0; x < GetClampedAgentWidth(); ++x)
+			{
+				AActor* Occupant = Terrain->GetCoordOccupant(Origin + FIntVector(x, y, 0));
+				if (Occupant && Occupant != GetOwner())
+				{
+					Holder = Occupant->GetName();
+					break;
+				}
+			}
+		}
+		UE_LOG(LogTemp, Log, TEXT("[Voxel] %s 让行：格 %s 被 %s 占着，原地等待"), *GetNameSafe(GetOwner()), *Path[PathIndex].Coord.ToString(), *Holder);
+	}
+
+	UpdateTickState();
+}
+
+bool UVoxelPathFollowingComponent::AdvanceYield(float DeltaTime)
+{
+	AActor* Owner = GetOwner();
+	AVoxelTerrainActor* FoundTerrain = ResolveTerrain();
+	if (!Owner || !FoundTerrain)
+	{
+		FinishMove(EVoxelPathFollowingResult::NoTerrain);
+		return false;
+	}
+	if (!Path.IsValidIndex(PathIndex))
+	{
+		FinishMove(EVoxelPathFollowingResult::Success);
+		return false;
+	}
+
+	if (!bClaimCells)
+	{
+		// 等待期间被关了占地开关：照旧往下走（防御性状态恢复，不是常规路径）
+		Status = EVoxelPathFollowingStatus::Moving;
+		UpdateTickState();
+		return true;
+	}
+
+	const FIntVector NextAnchor = Path[PathIndex].Coord;
+	if (FoundTerrain->TryOccupyFootprint(NextAnchor, GetClampedAgentWidth(), Owner))
+	{
+		NextClaimedCoord = NextAnchor;
+		bHasNextClaim = true;
+		Status = EVoxelPathFollowingStatus::Moving;
+		YieldTimer = 0.f;
+		UpdateTickState();
+		if (bLogNavigation)
+		{
+			UE_LOG(LogTemp, Log, TEXT("[Voxel] %s 让行结束：%s 腾出来了，继续走"), *GetNameSafe(Owner), *NextAnchor.ToString());
+		}
+		return true;
+	}
+
+	YieldTimer += DeltaTime;
+	if (MaxYieldTime > 0.f && YieldTimer >= MaxYieldTime)
+	{
+		TryAutoRepathOrFinish();
+	}
+	return false;
+}
+
+void UVoxelPathFollowingComponent::TryAutoRepathOrFinish()
+{
+	AActor* Owner = GetOwner();
+	AVoxelTerrainActor* FoundTerrain = ResolveTerrain();
+	if (bAutoRepath && bHasMoveGoal && RepathCount < MaxRepathCount && Owner && FoundTerrain)
+	{
+		float Travel = 0.f;
+		const float SecondsPerStep = FMath::Max(GetSecondsPerStep(), 0.01f);
+		TArray<FVoxelPathPoint> NewPath = FoundTerrain->FindPathScheduled(
+			GetCurrentCoord(), MoveGoal, MoveGoalHeight, GetClampedAgentWidth(), Owner, SecondsPerStep, 0.f, Travel);
+		if (NewPath.Num() > 1)
+		{
+			++RepathCount;
+			if (bLogNavigation)
+			{
+				UE_LOG(LogTemp, Log, TEXT("[Voxel] %s 让行超时，自动重寻路（第 %d/%d 次，目标 %s）"),
+					*GetNameSafe(Owner), RepathCount, MaxRepathCount, *MoveGoal.ToString());
+			}
+			// 顶掉旧请求但不广播 Aborted：换的是路，不是取消这次移动。重寻路的起点是当前所在格，
+			// 把自己排除在占用/预约之外（FindPathScheduled 的 Agent 参数），不再需要「先 Stop 再算」的顺序
+			if (RequestMoveInternal(MoveTemp(NewPath), /*bBroadcastAborted=*/false))
+			{
+				return;
+			}
+			// 新请求没出发（罕见：路径起点被挪动对不上）：落到下面按 Blocked 收尾
+		}
+	}
+
+	if (bLogNavigation)
+	{
+		UE_LOG(LogTemp, Log, TEXT("[Voxel] %s 让行超时（%.1fs），按 Blocked 收尾"), *GetNameSafe(GetOwner()), MaxYieldTime);
+	}
+	FinishMove(EVoxelPathFollowingResult::Blocked);
 }
 
 void UVoxelPathFollowingComponent::StepTowardTarget(const FVector& Target, float DeltaTime)
@@ -736,37 +1019,6 @@ void UVoxelPathFollowingComponent::OnReachedPathPoint(int32 Index)
 	}
 }
 
-/* ===================== 占地 ===================== */
-
-void UVoxelPathFollowingComponent::SyncClaimToCurrentCoord()
-{
-	if (!bClaimCells || !IsValid(Terrain))
-	{
-		return;
-	}
-
-	const FIntVector Current = GetCurrentCoord();
-	if (bHasClaim && Current == ClaimedCoord)
-	{
-		return;
-	}
-
-	if (Terrain->TryOccupyCoord(Current, GetOwner()))
-	{
-		if (bHasClaim)
-		{
-			Terrain->ReleaseCoord(ClaimedCoord, GetOwner());
-		}
-		ClaimedCoord = Current;
-		bHasClaim = true;
-	}
-	else
-	{
-		// 单人回合制下不该发生。这里**不动**旧登记，免得把别人的记录删掉
-		UE_LOG(LogTemp, Warning, TEXT("[Voxel] (%d,%d,%d) 已被别的 Agent 占着，本次占地登记跳过"), Current.X, Current.Y, Current.Z);
-	}
-}
-
 /* ===================== 连接交接 ===================== */
 
 void UVoxelPathFollowingComponent::StartLinkHop()
@@ -820,8 +1072,9 @@ void UVoxelPathFollowingComponent::FinishLinkHop()
 		}
 	}
 
+	// 占地转移：目标格在交给代理之前就已预占，这里落账并释放旧格
+	TransferClaimTo(Path[PathIndex].Coord);
 	++PathIndex;
-	SyncClaimToCurrentCoord();
 	if (PathIndex >= Path.Num())
 	{
 		FinishMove(EVoxelPathFollowingResult::Success);
@@ -852,7 +1105,7 @@ void UVoxelPathFollowingComponent::ReleaseActiveLink()
 
 /* ===================== 收尾 ===================== */
 
-void UVoxelPathFollowingComponent::FinishMove(EVoxelPathFollowingResult Code)
+void UVoxelPathFollowingComponent::FinishMove(EVoxelPathFollowingResult Code, bool bBroadcast)
 {
 	if (Status != EVoxelPathFollowingStatus::Idle)
 	{
@@ -862,7 +1115,18 @@ void UVoxelPathFollowingComponent::FinishMove(EVoxelPathFollowingResult Code)
 
 		if (bClaimCells && IsValid(Terrain))
 		{
+			// 预占的下一格随本次移动作废（中途 Blocked / Aborted 时不该继续拦着别人）
+			if (bHasNextClaim)
+			{
+				Terrain->ReleaseFootprint(NextClaimedCoord, GetClampedAgentWidth(), GetOwner());
+				bHasNextClaim = false;
+			}
 			SyncClaimToCurrentCoord();		// 收尾时把脚下这格登记准（起点格的手续也在这里还回去）
+		}
+		if (bHasReservation && IsValid(Terrain))
+		{
+			Terrain->RemoveReservationsFor(GetOwner());
+			bHasReservation = false;
 		}
 
 		if (bStopMovementOnFinish)
@@ -874,5 +1138,8 @@ void UVoxelPathFollowingComponent::FinishMove(EVoxelPathFollowingResult Code)
 	LastResult.Code = Code;
 	LastResult.PathPoints = Path.Num();
 	LastResult.FinalCoord = GetCurrentCoord();
-	OnMoveFinished.Broadcast(LastResult);
+	if (bBroadcast)
+	{
+		OnMoveFinished.Broadcast(LastResult);
+	}
 }

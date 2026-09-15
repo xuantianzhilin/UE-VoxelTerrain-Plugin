@@ -32,20 +32,22 @@ void UVoxelNavLinkJumpProxy::ReceiveLinkReached_Implementation(AActor* Agent, co
 	DestinationCoord = Destination;
 
 	StartLocation = Agent->GetActorLocation();
-	DestinationLocation = Terrain->CoordToWorldLocation(Destination);
+	// 落点的水平口径跟着跟随组件走：宽体型的 footprint 中心不在格心上（见 GetCellStandLocation）
+	FVector DestStand = Follower ? Follower->GetCellStandLocation(Destination) : Terrain->CoordToWorldLocation(Destination);
 
 	// 落点的竖直口径：此刻 Agent 正站在起跳格上（StartLinkHop 只在到点后交接），
-	// 所以「它现在的高度 − 起跳格格心」就是跟随组件实际在用的站位偏移（GetCellOffset，只含 Z）。
-	// 照着它给目标格补同样的偏移，落地才和平时走路落在同一个高度上 ——
+	// 「它现在的高度 + 两格格心的高差」才和平时走路落在同一个高度上 ——
 	// 直接按格心放会把角色按进地板半个胶囊高（基类注释里说的同一个坑）
 	if (Follower)
 	{
 		const FIntVector Standing = Follower->GetCurrentCoord();
 		if (Standing.X != MAX_int32 && Standing.Y != MAX_int32 && Standing.Z != MAX_int32)
 		{
-			DestinationLocation.Z += StartLocation.Z - Terrain->CoordToWorldLocation(Standing).Z;
+			DestStand.Z = StartLocation.Z
+				+ Terrain->CoordToWorldLocation(Destination).Z - Terrain->CoordToWorldLocation(Standing).Z;
 		}
 	}
+	DestinationLocation = DestStand;
 
 	Elapsed = 0.f;
 	bJumping = true;
